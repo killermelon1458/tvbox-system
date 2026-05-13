@@ -179,6 +179,88 @@ EXIT_CLOSES_KODI=$EXIT_CLOSES_KODI
 STATUS
 }
 
+
+close_youtube_current() {
+  # Current stable behavior was broad chromium close.
+  # tvboxctl uses narrower matching so Spotify/loading Chromium profiles are not killed.
+  if pgrep -f "chromium.*chromium-tvbox-youtube" >/dev/null 2>&1; then
+    pkill -TERM -f "chromium.*chromium-tvbox-youtube" 2>/dev/null || true
+    sleep 2
+    pkill -KILL -f "chromium.*chromium-tvbox-youtube" 2>/dev/null || true
+    return 0
+  fi
+
+  if pgrep -f "chromium.*${YOUTUBE_PROFILE}" >/dev/null 2>&1; then
+    pkill -TERM -f "chromium.*${YOUTUBE_PROFILE}" 2>/dev/null || true
+    sleep 2
+    pkill -KILL -f "chromium.*${YOUTUBE_PROFILE}" 2>/dev/null || true
+    return 0
+  fi
+
+  return 1
+}
+
+do_home() {
+  log "home requested; context=$(get_context)"
+
+  # Moonlight mode: disconnect local Moonlight client only.
+  # This is non-destructive and should not send Sunshine undo.
+  if moonlight_running; then
+    log "home: moonlight detected; soft-disconnecting local Moonlight"
+    "$MOONLIGHT_STOP_SOFT" 2>/tmp/tvbox-stop-moonlight.log || true
+    sleep 2
+
+    # If Moonlight was launched outside the tvbox-moonlight wrapper, fall back to Kodi here.
+    if ! pgrep -f '/usr/local/bin/tvbox-moonlight' >/dev/null 2>&1; then
+      log "home: no tvbox-moonlight wrapper detected; launching Kodi"
+      "$KODI_WRAPPER" &
+      set_context "kodi"
+    else
+      log "home: tvbox-moonlight wrapper detected; allowing wrapper to return Kodi"
+      set_context "kodi"
+    fi
+
+    exit 0
+  fi
+
+  # Spotify UI mode: stop Spotify playback/mode and return to Kodi.
+  if spotify_running; then
+    log "home: spotify mode detected; stopping Spotify and returning Kodi"
+    "$SPOTIFY_STOP" 2>/tmp/tvbox-stop-spotify.log || true
+    sleep 1
+    "$KODI_WRAPPER" &
+    set_context "kodi"
+    clear_preserved
+    exit 0
+  fi
+
+  # Kodi/Plex mode: stop playback if any, then open Favourites.
+  if kodi_running; then
+    log "home: kodi detected; stopping playback and opening Favourites"
+    kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1 || true
+    sleep 1
+    kodi-send --action="ActivateWindow(FavouritesBrowser)" >/dev/null 2>&1 || true
+    set_context "kodi"
+    exit 0
+  fi
+
+  # YouTube Chromium mode: close YouTube.
+  # The current YouTube launcher will then continue and relaunch Kodi.
+  if youtube_running; then
+    log "home: youtube detected; closing YouTube Chromium"
+    close_youtube_current || true
+    set_context "kodi"
+    clear_preserved
+    exit 0
+  fi
+
+  # Fallback: launch Kodi.
+  log "home: no known active app; launching Kodi"
+  "$KODI_WRAPPER" &
+  set_context "kodi"
+}
+
+
 evict_preserved() {
   # Phase 1 skeleton only. Real eviction behavior comes later.
   local preserved
@@ -248,7 +330,15 @@ case "$cmd" in
     evict_preserved
     ;;
 
-  home|exit|menu)
+  home)
+    if ! with_lock; then
+      log "home ignored because lock is held"
+      exit 0
+    fi
+    do_home
+    ;;
+
+  exit|menu)
     not_implemented "$cmd"
     ;;
 
