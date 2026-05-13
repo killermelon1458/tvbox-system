@@ -1,0 +1,20 @@
+#!/bin/bash
+set -u
+
+TVBOX_UID="$(id -u tvbox)"
+USER_BUS="unix:path=/run/user/$TVBOX_UID/bus"
+
+# Stop the foreground Chromium UI through the user service.
+XDG_RUNTIME_DIR="/run/user/$TVBOX_UID" \
+DBUS_SESSION_BUS_ADDRESS="$USER_BUS" \
+systemctl --user stop tvbox-spotify-mode.service 2>/tmp/tvbox-stop-spotify.log || true
+
+# Belt-and-suspenders cleanup.
+pkill -f "chromium.*chromium-tvbox-spotify-ui" 2>/dev/null || true
+
+# Restart Raspotify to release/clear Spotify playback state.
+if [ "$(id -u)" -eq 0 ]; then
+  /usr/bin/systemctl restart raspotify
+else
+  sudo -n /usr/bin/systemctl restart raspotify
+fi

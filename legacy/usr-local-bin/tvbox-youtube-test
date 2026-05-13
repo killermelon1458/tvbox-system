@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# Test YouTube TV-style web app mode on the TV box.
+# Flow:
+#   close Kodi -> launch YouTube in Chromium app mode -> relaunch Kodi after Chromium exits
+
+USER_ID="$(id -u)"
+
+# Try to target the active local GUI session, even when launched from SSH.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$USER_ID}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
+        if [ -S "$sock" ]; then
+            export WAYLAND_DISPLAY="$(basename "$sock")"
+            break
+        fi
+    done
+fi
+
+export DISPLAY="${DISPLAY:-:0}"
+
+# Close Kodi so Chromium gets the screen/audio resources.
+pkill -x kodi 2>/dev/null
+pkill -x kodi.bin 2>/dev/null
+sleep 2
+
+CHROME="/usr/bin/chromium"
+PROFILE="$HOME/.config/chromium-tvbox-youtube"
+
+"$CHROME" \
+  --user-data-dir="$PROFILE" \
+  --start-fullscreen \
+  --app=https://www.youtube.com/tv
+
+# When Chromium exits, relaunch Kodi through the known-good wrapper.
+/usr/local/bin/tvbox-kodi

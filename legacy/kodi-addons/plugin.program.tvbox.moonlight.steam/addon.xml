@@ -1,0 +1,16 @@
+<addon id="plugin.program.tvbox.moonlight.steam" name="Moonlight - Steam" version="1.0.2" provider-name="TVBox">
+  <requires>
+    <import addon="xbmc.python" version="3.0.0"/>
+  </requires>
+  <extension point="xbmc.python.pluginsource" library="addon.py">
+    <provides>executable</provides>
+  </extension>
+  <extension point="xbmc.addon.metadata">
+    <summary>Launch Steam Big Picture through Moonlight</summary>
+    <description>Closes Kodi and opens Steam Big Picture via Moonlight/Sunshine.</description>
+    <platform>all</platform>
+    <assets>
+      <icon>icon.png</icon>
+    </assets>
+  </extension>
+</addon>

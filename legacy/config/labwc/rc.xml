@@ -1,0 +1,8 @@
+<?xml version='1.0' encoding='utf-8'?>
+<labwc_config>
+  <keyboard>
+    <keybind key="F12">
+      <action name="Execute" command="/usr/local/bin/tvbox-home" />
+    </keybind>
+  </keyboard>
+</labwc_config>

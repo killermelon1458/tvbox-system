@@ -1,0 +1,56 @@
+#!/bin/bash
+
+
+# Moonlight mode: disconnect local Moonlight client and let tvbox-moonlight return to Kodi.
+# This behaves like Ctrl+Alt+Shift+Q, not the destructive Sunshine Stop action.
+if pgrep -x moonlight-qt >/dev/null 2>&1 || pgrep -x moonlight >/dev/null 2>&1; then
+  /usr/local/bin/tvbox-stop-moonlight 2>/tmp/tvbox-stop-moonlight.log || true
+  sleep 2
+
+  # If Moonlight was launched outside the tvbox-moonlight wrapper, fall back to Kodi here.
+  if ! pgrep -f '/usr/local/bin/tvbox-moonlight' >/dev/null 2>&1; then
+    /usr/local/bin/tvbox-kodi
+  fi
+
+  exit 0
+fi
+
+# TVBox global Home behavior:
+# - If Kodi is running, stop playback if any, then open Favourites.
+# - If Chromium YouTube mode is running, close Chromium so its launcher can relaunch Kodi.
+# - If nothing relevant is running, launch Kodi.
+
+# Spotify UI mode: stop Spotify playback and return to Kodi.
+if pgrep -f "chromium.*chromium-tvbox-spotify-ui" >/dev/null 2>&1; then
+  /usr/local/bin/tvbox-stop-spotify 2>/tmp/tvbox-stop-spotify.log || true
+  sleep 1
+  /usr/local/bin/tvbox-kodi
+  exit 0
+fi
+
+# If Kodi is running, stop playback and open Favourites.
+if pgrep -x kodi.bin >/dev/null || pgrep -x kodi >/dev/null; then
+    kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1
+    sleep 1
+    kodi-send --action="ActivateWindow(FavouritesBrowser)" >/dev/null 2>&1
+    exit 0
+fi
+
+# If Chromium/YouTube mode is running, close Chromium.
+# The tvbox-youtube launcher will then continue and relaunch Kodi.
+if pgrep -x chromium >/dev/null; then
+    pkill -TERM -x chromium
+    sleep 2
+    pkill -KILL -x chromium 2>/dev/null
+    exit 0
+fi
+
+# Future external apps can go here.
+# Example:
+# if pgrep -x moonlight-qt >/dev/null; then
+#     pkill -TERM -x moonlight-qt
+#     exit 0
+# fi
+
+# If nothing relevant is running, launch Kodi.
+/usr/local/bin/tvbox-kodi &

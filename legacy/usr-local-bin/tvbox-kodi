@@ -1,0 +1,42 @@
+#!/bin/bash
+set -u
+
+LOCK="/tmp/tvbox-kodi-launch.lock"
+LOG="/home/tvbox/.cache/tvbox-kodi.log"
+
+mkdir -p /home/tvbox/.cache
+
+export HOME=/home/tvbox
+export USER=tvbox
+export LOGNAME=tvbox
+export XDG_RUNTIME_DIR=/run/user/1000
+export DISPLAY="${DISPLAY:-:0}"
+
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  for s in "$XDG_RUNTIME_DIR"/wayland-*; do
+    [ -S "$s" ] || continue
+    export WAYLAND_DISPLAY="$(basename "$s")"
+    break
+  done
+fi
+
+log() {
+  echo "[$(date -Is)] $*" >> "$LOG"
+}
+
+(
+  flock -n 9 || {
+    log "Kodi launch already in progress; exiting."
+    exit 0
+  }
+
+  if pgrep -x kodi.bin >/dev/null 2>&1 || pgrep -x kodi >/dev/null 2>&1; then
+    log "Kodi already running; not launching duplicate."
+    kodi-send --action="ActivateWindow(FavouritesBrowser)" >> "$LOG" 2>&1 || true
+    exit 0
+  fi
+
+  log "Launching Kodi with ALSA backend."
+  exec /usr/bin/kodi --audio-backend=alsa "$@"
+
+) 9>"$LOCK"
