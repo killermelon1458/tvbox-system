@@ -56,6 +56,75 @@ start_bg() {
   "$@" 9>&- &
 }
 
+focus_kodi() {
+  # Kodi's labwc/wlrctl app_id is capitalized: Kodi
+  if command -v wlrctl >/dev/null 2>&1; then
+    wlrctl window focus Kodi >/dev/null 2>&1 || \
+    wlrctl toplevel focus Kodi >/dev/null 2>&1 || true
+  fi
+}
+
+kodi_fullscreen_state() {
+  python3 - <<'PYEOF'
+import socket, json
+
+req = {
+    "jsonrpc": "2.0",
+    "method": "GUI.GetProperties",
+    "params": {"properties": ["fullscreen"]},
+    "id": 1,
+}
+
+try:
+    s = socket.create_connection(("127.0.0.1", 9090), timeout=1)
+    s.sendall((json.dumps(req) + "\r\n").encode())
+    data = s.recv(4096).decode(errors="replace")
+    s.close()
+    obj = json.loads(data)
+    print("true" if obj.get("result", {}).get("fullscreen") else "false")
+except Exception:
+    print("unknown")
+PYEOF
+}
+
+ensure_kodi_fullscreen() {
+  local state
+  state="$(kodi_fullscreen_state)"
+
+  case "$state" in
+    true)
+      log "kodi fullscreen already true"
+      ;;
+    false)
+      log "kodi fullscreen false; toggling Kodi fullscreen"
+      kodi-send --action="togglefullscreen" >/dev/null 2>&1 || true
+      ;;
+    *)
+      log "kodi fullscreen state unknown; not toggling"
+      ;;
+  esac
+}
+
+show_kodi() {
+  # Launch or assert Kodi through the canonical idempotent wrapper,
+  # then focus it if labwc/wlrctl can see the window.
+  start_bg "$KODI_WRAPPER"
+
+  for _ in 1 2 3 4 5 6; do
+    sleep 0.5
+    if kodi_running; then
+      focus_kodi
+      ensure_kodi_fullscreen
+      focus_kodi
+      return 0
+    fi
+  done
+
+  focus_kodi
+  ensure_kodi_fullscreen
+  focus_kodi
+}
+
 usage() {
   cat <<USAGE
 Usage:
@@ -220,7 +289,7 @@ do_home() {
     # If Moonlight was launched outside the tvbox-moonlight wrapper, fall back to Kodi here.
     if ! pgrep -f '/usr/local/bin/tvbox-moonlight' >/dev/null 2>&1; then
       log "home: no tvbox-moonlight wrapper detected; launching Kodi"
-      start_bg "$KODI_WRAPPER"
+      show_kodi
       set_context "kodi"
     else
       log "home: tvbox-moonlight wrapper detected; allowing wrapper to return Kodi"
@@ -235,7 +304,7 @@ do_home() {
     log "home: spotify mode detected; stopping Spotify and returning Kodi"
     "$SPOTIFY_STOP" 2>/tmp/tvbox-stop-spotify.log || true
     sleep 1
-    start_bg "$KODI_WRAPPER"
+    show_kodi
     set_context "kodi"
     clear_preserved
     exit 0
@@ -249,7 +318,7 @@ do_home() {
     kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1 || true
     sleep 1
     kodi-send --action="ActivateWindow(FavouritesBrowser)" >/dev/null 2>&1 || true
-    start_bg "$KODI_WRAPPER"
+    show_kodi
     set_context "kodi"
     exit 0
   fi
@@ -266,7 +335,7 @@ do_home() {
 
   # Fallback: launch Kodi.
   log "home: no known active app; launching Kodi"
-  start_bg "$KODI_WRAPPER"
+  show_kodi
   set_context "kodi"
 }
 
