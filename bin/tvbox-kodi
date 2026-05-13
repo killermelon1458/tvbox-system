@@ -1,0 +1,71 @@
+#!/bin/bash
+set -u
+
+LOCK="/tmp/tvbox-kodi-launch.lock"
+LOG="/home/tvbox/.cache/tvbox-kodi.log"
+
+mkdir -p /home/tvbox/.cache
+
+export HOME=/home/tvbox
+export USER=tvbox
+export LOGNAME=tvbox
+export XDG_RUNTIME_DIR=/run/user/1000
+export DISPLAY="${DISPLAY:-:0}"
+
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  for s in "$XDG_RUNTIME_DIR"/wayland-*; do
+    [ -S "$s" ] || continue
+    export WAYLAND_DISPLAY="$(basename "$s")"
+    break
+  done
+fi
+
+log() {
+  echo "[$(date -Is)] $*" >> "$LOG"
+}
+
+kodi_running() {
+  pgrep -x kodi.bin >/dev/null 2>&1 || pgrep -x kodi >/dev/null 2>&1
+}
+
+open_favourites() {
+  kodi-send --action="PlayerControl(Stop)" >> "$LOG" 2>&1 || true
+  sleep 1
+  kodi-send --action="ActivateWindow(FavouritesBrowser)" >> "$LOG" 2>&1 || true
+}
+
+# If Kodi is already running, do not launch another copy.
+# This check must happen even when the launch lock is busy.
+if kodi_running; then
+  log "Kodi already running; opening Favourites."
+  open_favourites
+  exit 0
+fi
+
+# Lock only the short launch decision, not the whole lifetime of Kodi.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  log "Kodi launch already in progress; exiting."
+  exit 0
+fi
+
+# Re-check after acquiring the lock in case another caller launched Kodi.
+if kodi_running; then
+  log "Kodi appeared while waiting for launch path; opening Favourites."
+  open_favourites
+  exit 0
+fi
+
+log "Launching Kodi with ALSA backend."
+
+# Start Kodi in the graphical session, then let this wrapper exit.
+# Do NOT exec Kodi while holding FD 9, or Kodi inherits the lock forever.
+/usr/bin/kodi --audio-backend=alsa "$@" >> "$LOG" 2>&1 &
+kodi_pid=$!
+
+log "Kodi launch started with PID $kodi_pid."
+
+# Give Kodi a moment to appear before releasing wrapper control.
+sleep 2
+
+exit 0
