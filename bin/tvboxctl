@@ -64,46 +64,7 @@ focus_kodi() {
   fi
 }
 
-kodi_fullscreen_state() {
-  python3 - <<'PYEOF'
-import socket, json
 
-req = {
-    "jsonrpc": "2.0",
-    "method": "GUI.GetProperties",
-    "params": {"properties": ["fullscreen"]},
-    "id": 1,
-}
-
-try:
-    s = socket.create_connection(("127.0.0.1", 9090), timeout=1)
-    s.sendall((json.dumps(req) + "\r\n").encode())
-    data = s.recv(4096).decode(errors="replace")
-    s.close()
-    obj = json.loads(data)
-    print("true" if obj.get("result", {}).get("fullscreen") else "false")
-except Exception:
-    print("unknown")
-PYEOF
-}
-
-ensure_kodi_fullscreen() {
-  local state
-  state="$(kodi_fullscreen_state)"
-
-  case "$state" in
-    true)
-      log "kodi fullscreen already true"
-      ;;
-    false)
-      log "kodi fullscreen false; toggling Kodi fullscreen"
-      kodi-send --action="togglefullscreen" >/dev/null 2>&1 || true
-      ;;
-    *)
-      log "kodi fullscreen state unknown; not toggling"
-      ;;
-  esac
-}
 
 show_kodi() {
   # Launch or assert Kodi through the canonical idempotent wrapper,
@@ -114,14 +75,12 @@ show_kodi() {
     sleep 0.5
     if kodi_running; then
       focus_kodi
-      ensure_kodi_fullscreen
       focus_kodi
       return 0
     fi
   done
 
   focus_kodi
-  ensure_kodi_fullscreen
   focus_kodi
 }
 
