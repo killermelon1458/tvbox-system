@@ -1,0 +1,268 @@
+#!/bin/bash
+
+set -u
+
+CONFIG="/etc/tvboxctl.conf"
+
+# Defaults. /etc/tvboxctl.conf can override these.
+TVBOX_USER="tvbox"
+TVBOX_UID="1000"
+STATE_DIR="/run/user/1000/tvbox"
+FALLBACK_STATE_DIR="/tmp/tvbox"
+LOG_DIR="/home/tvbox/.cache"
+
+KODI_WRAPPER="/usr/local/bin/tvbox-kodi"
+YOUTUBE_WRAPPER="/usr/local/bin/tvbox-youtube"
+YOUTUBE_PROFILE="/home/tvbox/.config/chromium-tvbox-youtube"
+
+SPOTIFY_STOP="/usr/local/bin/tvbox-stop-spotify"
+SPOTIFY_PROFILE="/home/tvbox/.config/chromium-tvbox-spotify-ui"
+SPOTIFY_USER_SERVICE="tvbox-spotify-mode.service"
+
+MOONLIGHT_STOP_SOFT="/usr/local/bin/tvbox-stop-moonlight"
+MOONLIGHT_STOP_HARD="/usr/local/bin/tvbox-quit-moonlight-session"
+MOONLIGHT_HOST="192.168.1.189"
+
+MAX_PRESERVED_APPS=1
+EXIT_CLOSES_KODI=0
+
+if [ -f "$CONFIG" ]; then
+  # shellcheck source=/dev/null
+  . "$CONFIG"
+fi
+
+if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+  STATE_DIR="$FALLBACK_STATE_DIR"
+  mkdir -p "$STATE_DIR"
+fi
+
+mkdir -p "$LOG_DIR"
+
+ACTIVE_CONTEXT_FILE="$STATE_DIR/active-context"
+PRESERVED_APP_FILE="$STATE_DIR/preserved-app"
+PRESERVED_SINCE_FILE="$STATE_DIR/preserved-since"
+LOCK_FILE="$STATE_DIR/lock"
+LOG_FILE="$LOG_DIR/tvboxctl.log"
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+  logger -t tvboxctl "$*" 2>/dev/null || true
+}
+
+usage() {
+  cat <<USAGE
+Usage:
+  tvboxctl status
+  tvboxctl get-context
+  tvboxctl set-context <context>
+  tvboxctl get-preserved
+  tvboxctl set-preserved <app>
+  tvboxctl clear-preserved
+  tvboxctl evict-preserved
+  tvboxctl home
+  tvboxctl exit
+  tvboxctl menu
+  tvboxctl launch <youtube|plex|moonlight> [target]
+USAGE
+}
+
+with_lock() {
+  exec 9>"$LOCK_FILE"
+  flock -n 9
+}
+
+get_context() {
+  if [ -s "$ACTIVE_CONTEXT_FILE" ]; then
+    cat "$ACTIVE_CONTEXT_FILE"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+set_context() {
+  local ctx="${1:-unknown}"
+  printf '%s\n' "$ctx" > "$ACTIVE_CONTEXT_FILE"
+  log "active-context=$ctx"
+}
+
+get_preserved() {
+  if [ -s "$PRESERVED_APP_FILE" ]; then
+    cat "$PRESERVED_APP_FILE"
+  else
+    printf '\n'
+  fi
+}
+
+set_preserved() {
+  local app="${1:-}"
+  if [ -z "$app" ]; then
+    clear_preserved
+    return 0
+  fi
+
+  printf '%s\n' "$app" > "$PRESERVED_APP_FILE"
+  date --iso-8601=seconds > "$PRESERVED_SINCE_FILE" 2>/dev/null || date > "$PRESERVED_SINCE_FILE"
+  log "preserved-app=$app"
+}
+
+clear_preserved() {
+  rm -f "$PRESERVED_APP_FILE" "$PRESERVED_SINCE_FILE"
+  log "preserved-app cleared"
+}
+
+kodi_running() {
+  pgrep -x kodi >/dev/null 2>&1 || pgrep -x kodi.bin >/dev/null 2>&1
+}
+
+youtube_running() {
+  pgrep -f "chromium.*chromium-tvbox-youtube" >/dev/null 2>&1 || \
+  pgrep -f "chromium.*${YOUTUBE_PROFILE}" >/dev/null 2>&1
+}
+
+spotify_running() {
+  pgrep -f "chromium.*chromium-tvbox-spotify-ui" >/dev/null 2>&1 || \
+  pgrep -f "chromium.*${SPOTIFY_PROFILE}" >/dev/null 2>&1 || \
+  XDG_RUNTIME_DIR="/run/user/$TVBOX_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$TVBOX_UID/bus" \
+    systemctl --user is-active --quiet "$SPOTIFY_USER_SERVICE" 2>/dev/null
+}
+
+moonlight_running() {
+  pgrep -x moonlight-qt >/dev/null 2>&1 || pgrep -x moonlight >/dev/null 2>&1
+}
+
+bool_word() {
+  if "$@"; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
+}
+
+status() {
+  local ctx preserved since
+
+  ctx="$(get_context)"
+  preserved="$(get_preserved)"
+  since=""
+  if [ -s "$PRESERVED_SINCE_FILE" ]; then
+    since="$(cat "$PRESERVED_SINCE_FILE")"
+  fi
+
+  cat <<STATUS
+tvboxctl status
+---------------
+state-dir:        $STATE_DIR
+active-context:   $ctx
+preserved-app:    ${preserved:-none}
+preserved-since:  ${since:-none}
+
+process detection
+-----------------
+kodi-running:      $(bool_word kodi_running)
+youtube-running:   $(bool_word youtube_running)
+spotify-running:   $(bool_word spotify_running)
+moonlight-running: $(bool_word moonlight_running)
+
+configured paths
+----------------
+kodi-wrapper:      $KODI_WRAPPER
+youtube-wrapper:   $YOUTUBE_WRAPPER
+youtube-profile:   $YOUTUBE_PROFILE
+spotify-stop:      $SPOTIFY_STOP
+moonlight-soft:    $MOONLIGHT_STOP_SOFT
+moonlight-hard:    $MOONLIGHT_STOP_HARD
+
+config
+------
+MAX_PRESERVED_APPS=$MAX_PRESERVED_APPS
+EXIT_CLOSES_KODI=$EXIT_CLOSES_KODI
+STATUS
+}
+
+evict_preserved() {
+  # Phase 1 skeleton only. Real eviction behavior comes later.
+  local preserved
+  preserved="$(get_preserved)"
+  if [ -z "$preserved" ]; then
+    log "evict-preserved: nothing preserved"
+    return 0
+  fi
+
+  log "evict-preserved requested for $preserved, but eviction is not implemented in skeleton"
+  printf 'Eviction not implemented yet. Preserved app is still: %s\n' "$preserved"
+}
+
+not_implemented() {
+  local cmd="$*"
+  log "not implemented: $cmd"
+  printf 'tvboxctl: command not implemented yet: %s\n' "$cmd" >&2
+  return 2
+}
+
+cmd="${1:-}"
+
+case "$cmd" in
+  status)
+    status
+    ;;
+
+  get-context)
+    get_context
+    ;;
+
+  set-context)
+    shift
+    if ! with_lock; then
+      log "set-context ignored because lock is held"
+      exit 0
+    fi
+    set_context "${1:-unknown}"
+    ;;
+
+  get-preserved)
+    get_preserved
+    ;;
+
+  set-preserved)
+    shift
+    if ! with_lock; then
+      log "set-preserved ignored because lock is held"
+      exit 0
+    fi
+    set_preserved "${1:-}"
+    ;;
+
+  clear-preserved)
+    if ! with_lock; then
+      log "clear-preserved ignored because lock is held"
+      exit 0
+    fi
+    clear_preserved
+    ;;
+
+  evict-preserved)
+    if ! with_lock; then
+      log "evict-preserved ignored because lock is held"
+      exit 0
+    fi
+    evict_preserved
+    ;;
+
+  home|exit|menu)
+    not_implemented "$cmd"
+    ;;
+
+  launch)
+    shift
+    not_implemented "launch ${*:-}"
+    ;;
+
+  ""|-h|--help|help)
+    usage
+    ;;
+
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

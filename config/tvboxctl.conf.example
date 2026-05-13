@@ -1,0 +1,23 @@
+# TVBoxCtl config
+
+TVBOX_USER="tvbox"
+TVBOX_UID="1000"
+
+STATE_DIR="/run/user/1000/tvbox"
+FALLBACK_STATE_DIR="/tmp/tvbox"
+LOG_DIR="/home/tvbox/.cache"
+
+KODI_WRAPPER="/usr/local/bin/tvbox-kodi"
+YOUTUBE_WRAPPER="/usr/local/bin/tvbox-youtube"
+YOUTUBE_PROFILE="/home/tvbox/.config/chromium-tvbox-youtube"
+
+SPOTIFY_STOP="/usr/local/bin/tvbox-stop-spotify"
+SPOTIFY_PROFILE="/home/tvbox/.config/chromium-tvbox-spotify-ui"
+SPOTIFY_USER_SERVICE="tvbox-spotify-mode.service"
+
+MOONLIGHT_STOP_SOFT="/usr/local/bin/tvbox-stop-moonlight"
+MOONLIGHT_STOP_HARD="/usr/local/bin/tvbox-quit-moonlight-session"
+MOONLIGHT_HOST="192.168.1.189"
+
+MAX_PRESERVED_APPS=1
+EXIT_CLOSES_KODI=0
