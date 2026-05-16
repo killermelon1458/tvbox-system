@@ -57,7 +57,7 @@ log "Launching Kodi with ALSA backend."
 # Critical: close FD 9 in the Kodi child so Kodi does not hold the launch lock.
 (
   exec 9>&-
-  exec /usr/bin/kodi --audio-backend=alsa "$@"
+  exec /usr/bin/kodi -fs --audio-backend=alsa "$@"
 ) >> "$LOG" 2>&1 &
 
 kodi_pid=$!
