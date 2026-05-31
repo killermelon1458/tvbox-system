@@ -19,5 +19,5 @@ MOONLIGHT_STOP_SOFT="/usr/local/bin/tvbox-stop-moonlight"
 MOONLIGHT_STOP_HARD="/usr/local/bin/tvbox-quit-moonlight-session"
 MOONLIGHT_HOST="192.168.1.189"
 
-MAX_PRESERVED_APPS=1
+MAX_PRESERVED_APPS=0
 EXIT_CLOSES_KODI=0

@@ -22,8 +22,9 @@ SPOTIFY_USER_SERVICE="tvbox-spotify-mode.service"
 MOONLIGHT_STOP_SOFT="/usr/local/bin/tvbox-stop-moonlight"
 MOONLIGHT_STOP_HARD="/usr/local/bin/tvbox-quit-moonlight-session"
 MOONLIGHT_HOST="192.168.1.189"
+STEAMLINK_BIN="/usr/bin/steamlink"
 
-MAX_PRESERVED_APPS=1
+MAX_PRESERVED_APPS=0
 EXIT_CLOSES_KODI=0
 
 if [ -f "$CONFIG" ]; then
@@ -165,6 +166,77 @@ moonlight_running() {
   pgrep -x moonlight-qt >/dev/null 2>&1 || pgrep -x moonlight >/dev/null 2>&1
 }
 
+steamlink_window_running() {
+  command -v wlrctl >/dev/null 2>&1 || return 1
+
+  # Steam Link window states observed:
+  #   shell: SteamLink
+  #   shell: <game name> [Streaming]
+  wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|.* \[Streaming\])$'
+}
+
+steamlink_process_running() {
+  # Keep this narrow. Broad "steamlink" matching can match tvboxctl itself.
+  pgrep -x steamlink >/dev/null 2>&1 || \
+  pgrep -af '^/usr/bin/steamlink([[:space:]]|$)' >/dev/null 2>&1
+}
+
+steamlink_running() {
+  steamlink_window_running || steamlink_process_running
+}
+
+focus_steamlink() {
+  command -v wlrctl >/dev/null 2>&1 || return 0
+
+  if wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|.* \[Streaming\])$'; then
+    wlrctl window focus shell >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  wlrctl window focus title:SteamLink >/dev/null 2>&1 || \
+  wlrctl toplevel focus title:SteamLink >/dev/null 2>&1 || true
+}
+
+close_steamlink_current() {
+  log "steamlink: closing Steam Link/streaming window if running"
+
+  if command -v wlrctl >/dev/null 2>&1; then
+    # Close launcher state.
+    wlrctl window close title:SteamLink >/dev/null 2>&1 || \
+    wlrctl toplevel close title:SteamLink >/dev/null 2>&1 || true
+
+    # Close active streaming state.
+    if wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|.* \[Streaming\])$'; then
+      wlrctl window close shell >/dev/null 2>&1 || true
+    fi
+  fi
+
+  sleep 2
+
+  pkill -TERM -x steamlink 2>/dev/null || true
+  pkill -TERM -f '^/usr/bin/steamlink([[:space:]]|$)' 2>/dev/null || true
+
+  sleep 1
+
+  pkill -KILL -x steamlink 2>/dev/null || true
+  pkill -KILL -f '^/usr/bin/steamlink([[:space:]]|$)' 2>/dev/null || true
+}
+
+start_steamlink_bg() {
+  (
+    exec 9>&-
+    env \
+      HOME=/home/tvbox \
+      USER=tvbox \
+      LOGNAME=tvbox \
+      XDG_RUNTIME_DIR=/run/user/1000 \
+      WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+      DISPLAY="${DISPLAY:-:0}" \
+      "$STEAMLINK_BIN" >> "$LOG_DIR/tvbox-steamlink.log" 2>&1
+  ) &
+}
+
+
 bool_word() {
   if "$@"; then
     printf 'yes'
@@ -197,6 +269,7 @@ kodi-running:      $(bool_word kodi_running)
 youtube-running:   $(bool_word youtube_running)
 spotify-running:   $(bool_word spotify_running)
 moonlight-running: $(bool_word moonlight_running)
+steamlink-running: $(bool_word steamlink_running)
 
 configured paths
 ----------------
@@ -206,6 +279,7 @@ youtube-profile:   $YOUTUBE_PROFILE
 spotify-stop:      $SPOTIFY_STOP
 moonlight-soft:    $MOONLIGHT_STOP_SOFT
 moonlight-hard:    $MOONLIGHT_STOP_HARD
+steamlink-bin:     $STEAMLINK_BIN
 
 config
 ------
@@ -269,6 +343,18 @@ do_home() {
     exit 0
   fi
 
+  # Steam Link mode: close local Steam Link and return to Kodi.
+  # V1 policy: do not preserve Steam Link yet.
+  if steamlink_running; then
+    log "home: steamlink detected; closing Steam Link and returning Kodi"
+    close_steamlink_current || true
+    sleep 1
+    show_kodi
+    set_context "kodi"
+    clear_preserved
+    exit 0
+  fi
+
   # Kodi/Plex mode: stop playback if any, then open Favourites.
   # Also call the canonical Kodi wrapper afterward so Home can recover from
   # strange desktop states where Kodi is running but not foregrounded.
@@ -298,6 +384,58 @@ do_home() {
   set_context "kodi"
 }
 
+
+
+do_launch_steamlink() {
+  log "launch steamlink requested; context=$(get_context)"
+
+  if steamlink_running; then
+    log "launch steamlink: already running; focusing existing window"
+    focus_steamlink
+    set_context "steamlink"
+    exit 0
+  fi
+
+  # Stop Spotify mode if active.
+  if spotify_running; then
+    log "launch steamlink: stopping Spotify mode"
+    "$SPOTIFY_STOP" 2>/tmp/tvbox-stop-spotify.log || true
+    sleep 1
+  fi
+
+  # Stop Kodi playback and close Kodi so Steam Link owns the display.
+  if kodi_running; then
+    log "launch steamlink: stopping Kodi playback and closing Kodi"
+    kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1 || true
+    sleep 1
+    pkill -TERM -x kodi 2>/dev/null || true
+    pkill -TERM -x kodi.bin 2>/dev/null || true
+    sleep 2
+    pkill -KILL -x kodi 2>/dev/null || true
+    pkill -KILL -x kodi.bin 2>/dev/null || true
+  fi
+
+  # Close YouTube Chromium mode if present.
+  if youtube_running; then
+    log "launch steamlink: closing YouTube Chromium"
+    close_youtube_current || true
+  fi
+
+  log "launch steamlink: starting $STEAMLINK_BIN"
+  start_steamlink_bg
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    if steamlink_running; then
+      focus_steamlink
+      set_context "steamlink"
+      exit 0
+    fi
+  done
+
+  log "launch steamlink: start requested but no SteamLink window/process detected"
+  set_context "steamlink"
+}
 
 evict_preserved() {
   # Phase 1 skeleton only. Real eviction behavior comes later.
@@ -382,7 +520,19 @@ case "$cmd" in
 
   launch)
     shift
-    not_implemented "launch ${*:-}"
+    subcmd="${1:-}"
+    case "$subcmd" in
+      steamlink)
+        if ! with_lock; then
+          log "launch steamlink ignored because lock is held"
+          exit 0
+        fi
+        do_launch_steamlink
+        ;;
+      *)
+        not_implemented "launch ${*:-}"
+        ;;
+    esac
     ;;
 
   ""|-h|--help|help)
