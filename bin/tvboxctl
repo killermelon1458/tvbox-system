@@ -172,7 +172,7 @@ steamlink_window_running() {
   # Steam Link window states observed:
   #   shell: SteamLink
   #   shell: <game name> [Streaming]
-  wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|.* \[Streaming\])$'
+  wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|Streaming Client|.* \[Streaming\])$'
 }
 
 steamlink_process_running() {
@@ -188,7 +188,7 @@ steamlink_running() {
 focus_steamlink() {
   command -v wlrctl >/dev/null 2>&1 || return 0
 
-  if wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|.* \[Streaming\])$'; then
+  if wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|Streaming Client|.* \[Streaming\])$'; then
     wlrctl window focus shell >/dev/null 2>&1 || true
     return 0
   fi
@@ -206,7 +206,7 @@ close_steamlink_current() {
     wlrctl toplevel close title:SteamLink >/dev/null 2>&1 || true
 
     # Close active streaming state.
-    if wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|.* \[Streaming\])$'; then
+    if wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|Streaming Client|.* \[Streaming\])$'; then
       wlrctl window close shell >/dev/null 2>&1 || true
     fi
   fi
