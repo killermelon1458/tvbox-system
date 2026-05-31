@@ -1,0 +1,59 @@
+#!/bin/bash
+set -euo pipefail
+
+REPO_CFG="/opt/tvbox-system/config/labwc/rc.xml"
+LIVE_DIR="/home/tvbox/.config/labwc"
+LIVE_CFG="$LIVE_DIR/rc.xml"
+
+echo "=== TVBox labwc config restore ==="
+
+if [ ! -f "$REPO_CFG" ]; then
+  echo "ERROR: missing repo config: $REPO_CFG" >&2
+  exit 1
+fi
+
+echo "Validating repo XML..."
+python3 - <<PY
+import xml.etree.ElementTree as ET
+ET.parse("$REPO_CFG")
+print("XML OK: $REPO_CFG")
+PY
+
+echo "Checking required F12 binding..."
+if ! grep -q 'key="F12"' "$REPO_CFG" || ! grep -q '/usr/local/bin/tvbox-home' "$REPO_CFG"; then
+  echo "ERROR: repo config does not contain F12 -> /usr/local/bin/tvbox-home" >&2
+  exit 1
+fi
+
+echo "Checking tvbox-home..."
+if [ ! -x /usr/local/bin/tvbox-home ]; then
+  echo "ERROR: /usr/local/bin/tvbox-home is missing or not executable" >&2
+  exit 1
+fi
+
+echo "Checking tvboxctl syntax..."
+if [ -x /usr/local/bin/tvboxctl ]; then
+  bash -n /usr/local/bin/tvboxctl
+else
+  echo "WARNING: /usr/local/bin/tvboxctl missing or not executable"
+fi
+
+mkdir -p "$LIVE_DIR"
+
+if [ -f "$LIVE_CFG" ]; then
+  BACKUP="$LIVE_CFG.bak.$(date +%Y%m%d-%H%M%S)"
+  echo "Backing up live config to: $BACKUP"
+  cp "$LIVE_CFG" "$BACKUP"
+fi
+
+echo "Deploying repo config to live config..."
+cp "$REPO_CFG" "$LIVE_CFG"
+chown tvbox:tvbox "$LIVE_CFG"
+chmod 664 "$LIVE_CFG"
+
+echo
+echo "Final live F12/pointer config:"
+grep -n -A8 -B2 -E 'keyboard|F12|tvbox-home|pointerSpeed' "$LIVE_CFG" || true
+
+echo
+echo "Done. Reboot or restart the labwc session for keybind changes to take effect."

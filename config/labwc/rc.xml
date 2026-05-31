@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <keyboard>
+    <keybind key="F12">
+      <action name="Execute" command="/usr/local/bin/tvbox-home" />
+    </keybind>
+  </keyboard>
+
+  <libinput>
+    <device category="default">
+      <pointerSpeed>0.400000</pointerSpeed>
+    </device>
+  </libinput>
+</openbox_config>
