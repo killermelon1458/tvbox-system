@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+GS_SINK="$(pactl list sinks short | awk 'tolower($0) ~ /gamesir/ {print $2; exit}')"
+
+if [ -z "$GS_SINK" ]; then
+  echo "No GameSir sink found."
+  pactl list sinks short
+  exit 1
+fi
+
+pactl set-default-sink "$GS_SINK"
+pactl set-sink-mute "$GS_SINK" 0
+pactl set-sink-volume "$GS_SINK" 100%
+
+# Move currently playing PipeWire/Pulse streams to GameSir.
+for id in $(pactl list sink-inputs short | awk '{print $1}'); do
+  pactl move-sink-input "$id" "$GS_SINK" || true
+done
+
+echo "TVBox audio switched to GameSir: $GS_SINK"

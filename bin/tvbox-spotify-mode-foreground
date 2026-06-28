@@ -1,0 +1,100 @@
+#!/bin/bash
+set -u
+
+TVBOX_UID="$(id -u tvbox)"
+RUNTIME_DIR="/run/user/$TVBOX_UID"
+
+export HOME=/home/tvbox
+export USER=tvbox
+export LOGNAME=tvbox
+export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+
+LOG="/home/tvbox/.cache/tvbox-spotify-mode.log"
+SPOTIFY_PROFILE="/home/tvbox/.config/chromium-tvbox-spotify-ui"
+SPOTIFY_PAGE="/home/tvbox/.local/share/tvbox/spotify.html"
+
+mkdir -p /home/tvbox/.cache
+
+# Auto-detect active Wayland socket.
+unset WAYLAND_DISPLAY
+for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
+  if [ -S "$sock" ]; then
+    export WAYLAND_DISPLAY="$(basename "$sock")"
+    break
+  fi
+done
+
+{
+  echo "----- $(date -Is) tvbox-spotify-mode-foreground -----"
+  echo "USER=$(id -un)"
+  echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}"
+  echo "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}"
+  ls -l "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null || true
+} >> "$LOG"
+
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  echo "No Wayland display socket found; cannot launch Spotify UI." >> "$LOG"
+  exit 1
+fi
+
+CHROME="$(command -v chromium-browser || command -v chromium || true)"
+if [ -z "$CHROME" ]; then
+  echo "No Chromium binary found" >> "$LOG"
+  exit 1
+fi
+
+if pgrep -x moonlight >/dev/null 2>&1 || pgrep -x moonlight-qt >/dev/null 2>&1; then
+  echo "Moonlight process detected; disconnecting local Moonlight before Spotify mode." >> "$LOG"
+
+  # If Moonlight was launched by the TVBox wrapper, prevent that wrapper from relaunching Kodi.
+  if pgrep -f '/usr/local/bin/tvbox-moonlight' >/dev/null 2>&1; then
+    echo "spotify-takeover $(date -Is)" > /tmp/tvbox-suppress-kodi-return
+  fi
+
+  /usr/local/bin/tvbox-stop-moonlight 2>/tmp/tvbox-stop-moonlight.log || true
+  sleep 2
+fi
+
+# Spotify takeover needs to release ALSA as fast as possible.
+# Do not wait for graceful Kodi playback stop; Kodi is being closed anyway.
+if command -v kodi-send >/dev/null 2>&1; then
+  kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1 || true
+fi
+
+pkill -x kodi 2>/dev/null || true
+pkill -x kodi.bin 2>/dev/null || true
+sleep 0.2
+
+# If Kodi is stubborn, force it. This prevents librespot from sitting in a crash/restart loop.
+if pgrep -x kodi >/dev/null 2>&1 || pgrep -x kodi.bin >/dev/null 2>&1; then
+  pkill -9 -x kodi 2>/dev/null || true
+  pkill -9 -x kodi.bin 2>/dev/null || true
+  sleep 0.2
+fi
+
+pkill -f "/usr/local/bin/tvbox-youtube" 2>/dev/null || true
+pkill -f "chromium.*chromium-tvbox-youtube" 2>/dev/null || true
+pkill -f "chromium.*youtube.com/tv" 2>/dev/null || true
+
+mkdir -p "$SPOTIFY_PROFILE"
+
+
+# If librespot crashed while Kodi/Plex still held ALSA, recover it after the handoff.
+(
+  sleep 1
+  /usr/bin/sudo -n /usr/bin/systemctl reset-failed raspotify || true
+  /usr/bin/sudo -n /usr/bin/systemctl start raspotify || true
+) >> /home/tvbox/.cache/tvbox-spotify-recover.log 2>&1 &
+
+echo "Launching Spotify placeholder UI in foreground." >> "$LOG"
+
+exec "$CHROME" \
+  --ozone-platform=wayland \
+  --user-data-dir="$SPOTIFY_PROFILE" \
+  --no-first-run \
+  --disable-session-crashed-bubble \
+  --password-store=basic \
+  --start-fullscreen \
+  --kiosk \
+  --app="file://$SPOTIFY_PAGE" \
+  >> /home/tvbox/.cache/tvbox-spotify-ui.log 2>&1

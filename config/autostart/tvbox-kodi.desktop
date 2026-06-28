@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=TVBox Kodi Autostart
+Comment=Launch Kodi on login using the tvbox ALSA wrapper
+Exec=sh -c 'sleep 5; /usr/local/bin/tvbox-kodi'
+Terminal=false
+X-GNOME-Autostart-enabled=true

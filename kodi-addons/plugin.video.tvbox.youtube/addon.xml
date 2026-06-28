@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.video.tvbox.youtube"
+       name="YouTube TVBox"
+       version="1.0.2"
+       provider-name="TVBox">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0"/>
+    </requires>
+
+    <extension point="xbmc.python.pluginsource" library="default.py">
+        <provides>video</provides>
+    </extension>
+
+    <extension point="xbmc.addon.metadata">
+        <summary>Launch YouTube TV mode</summary>
+        <description>Closes Kodi, launches YouTube TV mode in Chromium, then relaunches Kodi after Chromium exits.</description>
+        <platform>linux</platform>
+        <assets>
+            <icon>icon.png</icon>
+        </assets>
+    </extension>
+</addon>

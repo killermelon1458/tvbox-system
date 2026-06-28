@@ -1,0 +1,135 @@
+#!/bin/bash
+set -u
+
+HOST="192.168.1.189"
+TARGET="${1:-moonlight}"
+LOG="/home/tvbox/.cache/tvbox-moonlight.log"
+STATE_DIR="/tmp/tvbox-moonlight"
+LAST_TARGET_FILE="$STATE_DIR/last-target"
+SUPPRESS_KODI_RETURN="/tmp/tvbox-suppress-kodi-return"
+
+mkdir -p /home/tvbox/.cache "$STATE_DIR"
+
+export HOME=/home/tvbox
+export USER=tvbox
+export LOGNAME=tvbox
+export XDG_RUNTIME_DIR=/run/user/1000
+export DISPLAY="${DISPLAY:-:0}"
+
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  for s in "$XDG_RUNTIME_DIR"/wayland-*; do
+    [ -S "$s" ] || continue
+    export WAYLAND_DISPLAY="$(basename "$s")"
+    break
+  done
+fi
+
+log() {
+  echo "[$(date -Is)] $*" >> "$LOG"
+}
+
+stop_kodi_cleanly() {
+  kodi-send --action="PlayerControl(Stop)" >> "$LOG" 2>&1 || true
+  sleep 1
+
+  pkill -TERM -x kodi 2>/dev/null || true
+  pkill -TERM -x kodi.bin 2>/dev/null || true
+
+  for i in {1..10}; do
+    if ! pgrep -x kodi >/dev/null 2>&1 && ! pgrep -x kodi.bin >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  log "Kodi still running; using KILL fallback."
+  pkill -KILL -x kodi 2>/dev/null || true
+  pkill -KILL -x kodi.bin 2>/dev/null || true
+  sleep 1
+}
+
+cleanup_return_to_kodi() {
+  trap - EXIT
+
+  if [ -f "$SUPPRESS_KODI_RETURN" ]; then
+    log "Kodi return suppressed by: $(cat "$SUPPRESS_KODI_RETURN" 2>/dev/null || echo unknown)"
+    rm -f "$SUPPRESS_KODI_RETURN"
+    return 0
+  fi
+
+  log "Moonlight wrapper cleanup: returning to Kodi."
+
+  # Prevent duplicate/stale Kodi instances.
+  stop_kodi_cleanly
+
+  /usr/local/bin/tvbox-kodi >> "$LOG" 2>&1 &
+}
+
+trap cleanup_return_to_kodi EXIT
+
+log "==== tvbox-moonlight target=$TARGET ===="
+log "HOST=$HOST DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+
+case "$TARGET" in
+  steam)
+    APP="Steam Big Picture"
+    ;;
+
+  minecraft)
+    APP="Minecraft"
+    ;;
+
+  moonlight|gui|plain)
+    APP=""
+    ;;
+
+  desktop)
+    APP="Desktop"
+    ;;
+
+  lowres)
+    APP="Low Res Desktop"
+    ;;
+
+  *)
+    log "ERROR: unknown target: $TARGET"
+    echo "Usage: tvbox-moonlight steam|minecraft|moonlight|desktop|lowres"
+    exit 2
+    ;;
+esac
+
+# Stop Spotify mode so it does not fight for HDMI/audio/video.
+/usr/local/bin/tvbox-stop-spotify >> "$LOG" 2>/tmp/tvbox-stop-spotify.log || true
+
+# Close Kodi before Moonlight takes over.
+stop_kodi_cleanly
+
+# Close YouTube Chromium mode if present.
+pkill -TERM -f "chromium.*chromium-tvbox-youtube" 2>/dev/null || true
+
+sleep 2
+
+LAST_TARGET=""
+if [ -f "$LAST_TARGET_FILE" ]; then
+  LAST_TARGET="$(cat "$LAST_TARGET_FILE" 2>/dev/null || true)"
+fi
+
+# Switching direct app targets should stop previous Sunshine app/session so undo runs.
+if [ -n "$APP" ] && [ -n "$LAST_TARGET" ] && [ "$LAST_TARGET" != "$TARGET" ]; then
+  log "Target changed from $LAST_TARGET to $TARGET; quitting previous Sunshine session first."
+  moonlight-qt quit "$HOST" >> "$LOG" 2>&1 || true
+  sleep 4
+fi
+
+if [ -n "$APP" ]; then
+  echo "$TARGET" > "$LAST_TARGET_FILE"
+  log "Launching direct Moonlight app: $APP"
+  moonlight-qt stream "$HOST" "$APP" >> "$LOG" 2>&1
+else
+  log "Launching Moonlight GUI"
+  moonlight-qt >> "$LOG" 2>&1
+fi
+
+CODE=$?
+log "Moonlight exited with code $CODE"
+exit "$CODE"

@@ -1,0 +1,25 @@
+#!/bin/bash
+set -u
+
+LOG="/home/tvbox/.cache/tvbox-stop-moonlight.log"
+mkdir -p /home/tvbox/.cache
+
+{
+  echo
+  echo "==== $(date -Is) tvbox-stop-moonlight ===="
+} >> "$LOG"
+
+# TERM should close the local Moonlight client and leave the Sunshine session resumable.
+pkill -TERM -x moonlight-qt >> "$LOG" 2>&1 || true
+pkill -TERM -x moonlight >> "$LOG" 2>&1 || true
+
+sleep 2
+
+# Fallback only if Moonlight ignores TERM.
+if pgrep -x moonlight-qt >/dev/null 2>&1 || pgrep -x moonlight >/dev/null 2>&1; then
+  echo "Moonlight still running; using KILL fallback." >> "$LOG"
+  pkill -KILL -x moonlight-qt >> "$LOG" 2>&1 || true
+  pkill -KILL -x moonlight >> "$LOG" 2>&1 || true
+fi
+
+exit 0

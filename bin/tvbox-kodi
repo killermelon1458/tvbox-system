@@ -52,6 +52,7 @@ if kodi_running; then
   exit 0
 fi
 
+/usr/local/bin/tvbox-audio-hdmi >> "$LOG" 2>&1 || true
 log "Launching Kodi with ALSA backend."
 
 # Critical: close FD 9 in the Kodi child so Kodi does not hold the launch lock.

@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# Emergency Mario Kart / Mupen64Plus exit.
+# Keep this before tvboxctl so F12/Home can close the emulator.
+if pgrep -x mupen64plus >/dev/null 2>&1; then
+  pkill -TERM -x mupen64plus 2>/dev/null || true
+  sleep 1
+  /usr/local/bin/tvbox-kodi
+  exit 0
+fi
+
+exec /usr/local/bin/tvboxctl home "$@"

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=TVBox Force HDMI Audio
+Exec=sh -c 'sleep 5; /usr/local/bin/tvbox-audio-hdmi'
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,40 @@
+#!/bin/bash
+set -u
+
+export HOME=/home/tvbox
+export USER=tvbox
+export LOGNAME=tvbox
+export XDG_RUNTIME_DIR=/run/user/1000
+export WAYLAND_DISPLAY=wayland-0
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+export SDL_VIDEODRIVER=wayland
+export SDL_AUDIODRIVER=alsa
+
+cleanup() {
+  pkill -TERM -x mupen64plus 2>/dev/null || true
+  sleep 1
+  /usr/local/bin/tvbox-kodi
+}
+
+trap cleanup INT TERM EXIT
+
+/usr/local/bin/tvbox-stop-spotify 2>/tmp/tvbox-stop-spotify.log || true
+
+pkill -TERM -x kodi 2>/dev/null || true
+pkill -TERM -x kodi.bin 2>/dev/null || true
+sleep 2
+
+/usr/local/bin/mupen64plus \
+  --fullscreen \
+  --resolution 640x480 \
+  --corelib /usr/local/lib/libmupen64plus.so.2 \
+  --plugindir /usr/local/lib/mupen64plus \
+  --gfx mupen64plus-video-rice.so \
+  --audio mupen64plus-audio-sdl.so \
+  --input mupen64plus-input-sdl.so \
+  --rsp mupen64plus-rsp-hle.so \
+  "/home/tvbox/Games/ROMs/N64/Mario Kart 64 (USA).z64"
+
+trap - INT TERM EXIT
+/usr/local/bin/tvbox-kodi
+

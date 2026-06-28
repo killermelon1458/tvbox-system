@@ -1,0 +1,33 @@
+#!/bin/bash
+set -e
+
+HDMI_SINK="alsa_output.platform-107c706400.hdmi.hdmi-stereo"
+
+pactl set-default-sink "$HDMI_SINK"
+pactl set-sink-mute "$HDMI_SINK" 0
+pactl set-sink-volume "$HDMI_SINK" 100%
+
+# Move currently playing PipeWire/Pulse streams to HDMI.
+for id in $(pactl list sink-inputs short | awk '{print $1}'); do
+  pactl move-sink-input "$id" "$HDMI_SINK" || true
+done
+
+# Find the WirePlumber numeric sink ID safely.
+HDMI_ID="$(wpctl status | awk '
+/Built-in Audio Digital Stereo \(HDMI\)/ {
+  for (i = 1; i <= NF; i++) {
+    if ($i ~ /^[0-9]+\.$/) {
+      gsub(/\./, "", $i)
+      print $i
+      exit
+    }
+  }
+}')"
+
+if [ -n "$HDMI_ID" ]; then
+  wpctl set-default "$HDMI_ID" || true
+  wpctl set-mute "$HDMI_ID" 0 || true
+  wpctl set-volume "$HDMI_ID" 1.0 || true
+fi
+
+echo "TVBox audio forced to HDMI."

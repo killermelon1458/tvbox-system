@@ -1,0 +1,49 @@
+#!/bin/bash
+set -u
+
+CACHE_DIR="/home/tvbox/.cache"
+EVENT_LOG="$CACHE_DIR/tvbox-spotify-event.log"
+LOCK_FILE="/tmp/tvbox-spotify-mode.lockfile"
+
+EVENT="${PLAYER_EVENT:-unknown}"
+TVBOX_UID="$(id -u tvbox)"
+USER_BUS="unix:path=/run/user/$TVBOX_UID/bus"
+
+mkdir -p "$CACHE_DIR"
+
+{
+  echo "----- $(date -Is) -----"
+  echo "USER=$(id -un)"
+  echo "PWD=$(pwd)"
+  echo "PLAYER_EVENT=$EVENT"
+  echo "TRACK_ID=${TRACK_ID:-}"
+  echo "OLD_TRACK_ID=${OLD_TRACK_ID:-}"
+} >> "$EVENT_LOG"
+
+case "$EVENT" in
+  session_connected|session_client_changed|play_request_id_changed|loading|track_changed|playing)
+    {
+      echo "Trigger event accepted: $EVENT"
+      echo "Starting tvbox-spotify-mode.service through user systemd"
+    } >> "$EVENT_LOG"
+
+    (
+      flock -n 9 || {
+        echo "Launch skipped: another start request is already running" >> "$EVENT_LOG"
+        exit 0
+      }
+
+      XDG_RUNTIME_DIR="/run/user/$TVBOX_UID" \
+      DBUS_SESSION_BUS_ADDRESS="$USER_BUS" \
+      systemctl --user start tvbox-spotify-mode.service \
+        >> "$EVENT_LOG" 2>&1
+
+      echo "systemctl --user start exit code: $?" >> "$EVENT_LOG"
+    ) 9>"$LOCK_FILE" &
+    ;;
+  *)
+    echo "Event ignored: $EVENT" >> "$EVENT_LOG"
+    ;;
+esac
+
+exit 0

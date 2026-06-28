@@ -1,0 +1,61 @@
+#!/bin/bash
+set -u
+
+export HOME=/home/tvbox
+export USER=tvbox
+export LOGNAME=tvbox
+export XDG_RUNTIME_DIR=/run/user/$(id -u tvbox)
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
+export DISPLAY="${DISPLAY:-:0}"
+
+SPOTIFY_PROFILE="/home/tvbox/.config/chromium-tvbox-spotify-ui"
+SPOTIFY_PAGE="/home/tvbox/.local/share/tvbox/spotify.html"
+
+CHROME="$(command -v chromium-browser || command -v chromium || true)"
+if [ -z "$CHROME" ]; then
+  echo "No Chromium binary found" >&2
+  exit 1
+fi
+
+# Do not unexpectedly kill a real Moonlight/game stream from a phone Spotify tap.
+# Use exact process-name matching only. Do not use broad pgrep -f here.
+if pgrep -x moonlight >/dev/null 2>&1 || pgrep -x moonlight-qt >/dev/null 2>&1; then
+  echo "Real Moonlight process detected; not entering Spotify mode." >&2
+  pgrep -a -x moonlight >&2 2>/dev/null || true
+  pgrep -a -x moonlight-qt >&2 2>/dev/null || true
+  exit 0
+fi
+
+# Stop Kodi playback first, then close Kodi.
+if command -v kodi-send >/dev/null 2>&1; then
+  kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1 || true
+  sleep 0.5
+fi
+
+pkill -x kodi 2>/dev/null || true
+pkill -x kodi.bin 2>/dev/null || true
+
+# Stop the YouTube launcher wrapper before killing Chromium,
+# otherwise the wrapper may relaunch Kodi after YouTube exits.
+pkill -f "/usr/local/bin/tvbox-youtube" 2>/dev/null || true
+pkill -f "chromium.*chromium-tvbox-youtube" 2>/dev/null || true
+pkill -f "chromium.*youtube.com/tv" 2>/dev/null || true
+
+# Avoid duplicate Spotify UI windows.
+if pgrep -f "chromium.*chromium-tvbox-spotify-ui" >/dev/null 2>&1; then
+  exit 0
+fi
+
+mkdir -p "$SPOTIFY_PROFILE"
+
+nohup "$CHROME" \
+  --user-data-dir="$SPOTIFY_PROFILE" \
+  --no-first-run \
+  --disable-session-crashed-bubble \
+  --password-store=basic \
+  --start-fullscreen \
+  --kiosk \
+  --app="file://$SPOTIFY_PAGE" \
+  >/tmp/tvbox-spotify-ui.log 2>&1 &
+
+exit 0

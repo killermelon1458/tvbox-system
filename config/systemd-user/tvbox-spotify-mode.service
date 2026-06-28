@@ -1,0 +1,11 @@
+[Unit]
+Description=TVBox Spotify visible mode
+
+[Service]
+Type=simple
+Environment=HOME=/home/tvbox
+Environment=USER=tvbox
+Environment=LOGNAME=tvbox
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/local/bin/tvbox-spotify-mode-foreground
+Restart=no

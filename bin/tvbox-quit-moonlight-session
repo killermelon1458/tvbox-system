@@ -1,0 +1,36 @@
+#!/bin/bash
+set -u
+
+HOST="192.168.1.189"
+LOG="/home/tvbox/.cache/tvbox-quit-moonlight-session.log"
+mkdir -p /home/tvbox/.cache
+
+{
+  echo
+  echo "==== $(date -Is) tvbox-quit-moonlight-session ===="
+} >> "$LOG"
+
+# This tells Sunshine to stop the active session/app.
+# For Steam/Minecraft, this should trigger the configured Sunshine undo wrapper.
+moonlight-qt quit "$HOST" >> "$LOG" 2>&1 || true
+
+sleep 3
+
+# Close the local Moonlight client if it is still open.
+pkill -TERM -x moonlight-qt >> "$LOG" 2>&1 || true
+pkill -TERM -x moonlight >> "$LOG" 2>&1 || true
+
+sleep 2
+
+if pgrep -x moonlight-qt >/dev/null 2>&1 || pgrep -x moonlight >/dev/null 2>&1; then
+  echo "Moonlight still running; using KILL fallback." >> "$LOG"
+  pkill -KILL -x moonlight-qt >> "$LOG" 2>&1 || true
+  pkill -KILL -x moonlight >> "$LOG" 2>&1 || true
+fi
+
+# If this was not launched through tvbox-moonlight, still return to Kodi.
+if ! pgrep -f '/usr/local/bin/tvbox-moonlight' >/dev/null 2>&1; then
+  /usr/local/bin/tvbox-kodi >> "$LOG" 2>&1 &
+fi
+
+exit 0

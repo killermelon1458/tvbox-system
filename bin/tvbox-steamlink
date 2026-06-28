@@ -1,0 +1,63 @@
+#!/bin/bash
+set -u
+
+steamlink_window_running() {
+  wlrctl window list 2>/dev/null | grep -qE '^shell:[[:space:]]+(SteamLink|.* \[Streaming\])$'
+}
+
+cmd="${1:-start}"
+
+case "$cmd" in
+  start|launch)
+    exec /usr/local/bin/tvboxctl launch steamlink
+    ;;
+
+  focus)
+    if steamlink_window_running; then
+      wlrctl window focus shell 2>/dev/null || true
+    else
+      wlrctl window focus title:SteamLink 2>/dev/null || \
+      wlrctl toplevel focus title:SteamLink 2>/dev/null || true
+    fi
+    ;;
+
+  status)
+    if steamlink_window_running; then
+      echo "running-window"
+      exit 0
+    fi
+
+    if pgrep -x steamlink >/dev/null 2>&1 || \
+       pgrep -af '^/usr/bin/steamlink([[:space:]]|$)' >/dev/null 2>&1; then
+      echo "running-process"
+      exit 0
+    fi
+
+    echo "stopped"
+    exit 1
+    ;;
+
+  stop)
+    wlrctl window close title:SteamLink >/dev/null 2>&1 || \
+    wlrctl toplevel close title:SteamLink >/dev/null 2>&1 || true
+
+    if steamlink_window_running; then
+      wlrctl window close shell >/dev/null 2>&1 || true
+    fi
+
+    sleep 2
+
+    pkill -TERM -x steamlink 2>/dev/null || true
+    pkill -TERM -f '^/usr/bin/steamlink([[:space:]]|$)' 2>/dev/null || true
+
+    sleep 1
+
+    pkill -KILL -x steamlink 2>/dev/null || true
+    pkill -KILL -f '^/usr/bin/steamlink([[:space:]]|$)' 2>/dev/null || true
+    ;;
+
+  *)
+    echo "Usage: tvbox-steamlink {start|focus|status|stop}" >&2
+    exit 2
+    ;;
+esac
