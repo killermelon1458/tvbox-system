@@ -1,0 +1,12 @@
+<keymap>
+  <global>
+    <joystick profile="game.controller.default">
+      <guide>ActivateWindow(FavouritesBrowser)</guide>
+    </joystick>
+  </global>
+  <FullscreenVideo>
+    <joystick profile="game.controller.default">
+      <guide>ActivateWindow(FavouritesBrowser)</guide>
+    </joystick>
+  </FullscreenVideo>
+</keymap>

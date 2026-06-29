@@ -1,11 +1,10 @@
 #!/bin/bash
 
-/usr/local/bin/tvbox-stop-spotify 2>/tmp/tvbox-stop-spotify.log || true
-
-
 # Launch YouTube TV web app mode in Chromium.
 # Flow:
 #   close Kodi -> launch YouTube in Chromium app mode -> relaunch Kodi after Chromium exits
+
+/usr/local/bin/tvbox-stop-spotify 2>/tmp/tvbox-stop-spotify.log || true
 
 USER_ID="$(id -u)"
 
@@ -23,6 +22,8 @@ if [ -z "${WAYLAND_DISPLAY:-}" ]; then
 fi
 
 export DISPLAY="${DISPLAY:-:0}"
+
+/usr/local/bin/tvbox-inputctl set-profile controller_kbm_generic 2>/tmp/tvbox-inputctl-youtube.log || true
 
 # Close Kodi so Chromium gets the screen/audio/input resources.
 pkill -TERM -x kodi 2>/dev/null

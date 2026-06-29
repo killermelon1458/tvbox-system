@@ -23,6 +23,7 @@ MOONLIGHT_STOP_SOFT="/usr/local/bin/tvbox-stop-moonlight"
 MOONLIGHT_STOP_HARD="/usr/local/bin/tvbox-quit-moonlight-session"
 MOONLIGHT_HOST="192.168.1.189"
 STEAMLINK_BIN="/usr/bin/steamlink"
+INPUTCTL="/usr/local/bin/tvbox-inputctl"
 
 MAX_PRESERVED_APPS=0
 EXIT_CLOSES_KODI=0
@@ -57,6 +58,18 @@ start_bg() {
   "$@" 9>&- &
 }
 
+set_input_profile() {
+  local profile="${1:-}"
+  [ -n "$profile" ] || return 0
+
+  if [ -x "$INPUTCTL" ]; then
+    "$INPUTCTL" set-profile "$profile" >/dev/null 2>&1 || \
+      log "input-profile: failed to set $profile"
+  else
+    log "input-profile: $INPUTCTL missing or not executable"
+  fi
+}
+
 focus_kodi() {
   # Kodi's labwc/wlrctl app_id is capitalized: Kodi
   if command -v wlrctl >/dev/null 2>&1; then
@@ -70,6 +83,7 @@ focus_kodi() {
 show_kodi() {
   # Launch or assert Kodi through the canonical idempotent wrapper,
   # then focus it if labwc/wlrctl can see the window.
+  set_input_profile "kodi_native_minimal"
   start_bg "$KODI_WRAPPER"
 
   for _ in 1 2 3 4 5 6; do
@@ -388,6 +402,7 @@ do_home() {
 
 do_launch_steamlink() {
   log "launch steamlink requested; context=$(get_context)"
+  set_input_profile "passthrough"
 
   if steamlink_running; then
     log "launch steamlink: already running; focusing existing window"

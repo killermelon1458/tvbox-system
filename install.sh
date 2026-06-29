@@ -116,6 +116,15 @@ if [ -d "$REPO_DIR/kodi-addons" ]; then
 fi
 
 echo
+echo "Installing Kodi keymaps..."
+if [ -d "$REPO_DIR/config/kodi/userdata/keymaps" ]; then
+  install -d -m 0775 -o "$TVBOX_USER" -g "$TVBOX_USER" "$TVBOX_HOME/.kodi/userdata/keymaps"
+  find "$REPO_DIR/config/kodi/userdata/keymaps" -maxdepth 1 -type f -name '*.xml' | sort | while read -r keymap; do
+    install_file "$keymap" "$TVBOX_HOME/.kodi/userdata/keymaps/$(basename "$keymap")" 0644 "$TVBOX_USER:$TVBOX_USER"
+  done
+fi
+
+echo
 echo "Reloading systemd..."
 systemctl daemon-reload || true
 

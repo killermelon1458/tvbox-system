@@ -1,0 +1,339 @@
+#!/bin/bash
+set -u
+
+TVBOX_USER="${TVBOX_USER:-tvbox}"
+TVBOX_UID="${TVBOX_UID:-1000}"
+STATE_DIR="${TVBOX_INPUTCTL_STATE_DIR:-/run/user/$TVBOX_UID/tvbox}"
+FALLBACK_STATE_DIR="${TVBOX_INPUTCTL_FALLBACK_STATE_DIR:-/tmp/tvbox}"
+LOG_DIR="${TVBOX_INPUTCTL_LOG_DIR:-/home/tvbox/.cache}"
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")"
+REPO_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+PROFILE_DIR="${TVBOX_INPUTCTL_PROFILE_DIR:-$REPO_DIR/input-profiles}"
+
+KNOWN_PROFILES="none kodi_native kodi_native_minimal passthrough controller_kbm_generic youtube_remote spotify_ui desktop_mouse"
+DEFAULT_PROFILE="kodi_native_minimal"
+BACKEND="${TVBOX_INPUTCTL_BACKEND:-antimicrox}"
+ANTIMICROX_BIN="${TVBOX_ANTIMICROX_BIN:-/usr/bin/antimicrox}"
+ANTIMICROX_CONTROLLER="${TVBOX_ANTIMICROX_CONTROLLER:-}"
+DRY_RUN="${TVBOX_INPUTCTL_DRY_RUN:-0}"
+
+if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+  STATE_DIR="$FALLBACK_STATE_DIR"
+  mkdir -p "$STATE_DIR"
+fi
+
+mkdir -p "$LOG_DIR"
+
+INPUT_PROFILE_FILE="$STATE_DIR/input-profile"
+LOCK_FILE="$STATE_DIR/inputctl.lock"
+ANTIMICROX_PID_FILE="$STATE_DIR/antimicrox.pid"
+LOG_FILE="$LOG_DIR/tvbox-inputctl.log"
+ANTIMICROX_LOG_FILE="$LOG_DIR/tvbox-antimicrox.log"
+
+setup_gui_env() {
+  export HOME="${HOME:-/home/$TVBOX_USER}"
+  export USER="${USER:-$TVBOX_USER}"
+  export LOGNAME="${LOGNAME:-$TVBOX_USER}"
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$TVBOX_UID}"
+  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+  export DISPLAY="${DISPLAY:-:0}"
+
+  if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
+      [ -S "$sock" ] || continue
+      export WAYLAND_DISPLAY="$(basename "$sock")"
+      break
+    done
+  fi
+}
+
+usage() {
+  cat <<USAGE
+Usage:
+  tvbox-inputctl status
+  tvbox-inputctl get-profile
+  tvbox-inputctl set-profile <profile>
+  tvbox-inputctl reset
+  tvbox-inputctl stop
+  tvbox-inputctl list-profiles
+  tvbox-inputctl list-controllers
+USAGE
+}
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+  logger -t tvbox-inputctl "$*" 2>/dev/null || true
+}
+
+with_lock() {
+  exec 9>"$LOCK_FILE"
+  flock -n 9
+}
+
+is_valid_profile_name() {
+  case "${1:-}" in
+    ""|*[!A-Za-z0-9_.:-]*)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+is_known_profile() {
+  local requested="${1:-}"
+  local profile
+
+  for profile in $KNOWN_PROFILES; do
+    if [ "$profile" = "$requested" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+profile_file() {
+  case "${1:-}" in
+    controller_kbm_generic|youtube_remote|spotify_ui|desktop_mouse)
+      printf '%s/controller_kbm_generic.gamecontroller.amgp\n' "$PROFILE_DIR"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+get_profile() {
+  if [ -s "$INPUT_PROFILE_FILE" ]; then
+    cat "$INPUT_PROFILE_FILE"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+antimicrox_running() {
+  local pid
+
+  [ -s "$ANTIMICROX_PID_FILE" ] || return 1
+  pid="$(cat "$ANTIMICROX_PID_FILE" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+
+  ps -p "$pid" -o comm= 2>/dev/null | grep -qx antimicrox
+}
+
+stop_antimicrox() {
+  local pid
+
+  if ! [ -s "$ANTIMICROX_PID_FILE" ]; then
+    log "antimicrox: no TVBox-owned pid file"
+    return 0
+  fi
+
+  pid="$(cat "$ANTIMICROX_PID_FILE" 2>/dev/null || true)"
+  if [ -z "$pid" ]; then
+    rm -f "$ANTIMICROX_PID_FILE"
+    return 0
+  fi
+
+  if ! ps -p "$pid" -o comm= 2>/dev/null | grep -qx antimicrox; then
+    log "antimicrox: stale pid=$pid"
+    rm -f "$ANTIMICROX_PID_FILE"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = "1" ]; then
+    log "dry-run: would stop antimicrox pid=$pid"
+    return 0
+  fi
+
+  log "antimicrox: stopping TVBox-owned pid=$pid"
+  kill -TERM "$pid" 2>/dev/null || true
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! ps -p "$pid" >/dev/null 2>&1; then
+      rm -f "$ANTIMICROX_PID_FILE"
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  log "antimicrox: TERM timeout; killing pid=$pid"
+  kill -KILL "$pid" 2>/dev/null || true
+  rm -f "$ANTIMICROX_PID_FILE"
+}
+
+start_antimicrox_profile() {
+  local profile="$1"
+  local cfg
+
+  cfg="$(profile_file "$profile")"
+
+  if [ ! -f "$cfg" ]; then
+    printf 'tvbox-inputctl: missing AntiMicroX profile: %s\n' "$cfg" >&2
+    return 1
+  fi
+
+  if [ ! -x "$ANTIMICROX_BIN" ]; then
+    printf 'tvbox-inputctl: AntiMicroX not executable: %s\n' "$ANTIMICROX_BIN" >&2
+    return 1
+  fi
+
+  stop_antimicrox
+  setup_gui_env
+
+  log "antimicrox: starting profile=$profile file=$cfg controller=${ANTIMICROX_CONTROLLER:-all}"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    if [ -n "$ANTIMICROX_CONTROLLER" ]; then
+      printf 'dry-run: %s --hidden --profile %s --profile-controller %s\n' "$ANTIMICROX_BIN" "$cfg" "$ANTIMICROX_CONTROLLER"
+    else
+      printf 'dry-run: %s --hidden --profile %s\n' "$ANTIMICROX_BIN" "$cfg"
+    fi
+    return 0
+  fi
+
+  if [ -n "$ANTIMICROX_CONTROLLER" ]; then
+    (
+      exec 9>&-
+      exec "$ANTIMICROX_BIN" --hidden --profile "$cfg" --profile-controller "$ANTIMICROX_CONTROLLER"
+    ) >> "$ANTIMICROX_LOG_FILE" 2>&1 &
+  else
+    (
+      exec 9>&-
+      exec "$ANTIMICROX_BIN" --hidden --profile "$cfg"
+    ) >> "$ANTIMICROX_LOG_FILE" 2>&1 &
+  fi
+
+  printf '%s\n' "$!" > "$ANTIMICROX_PID_FILE"
+  sleep 0.5
+
+  if ! antimicrox_running; then
+    log "antimicrox: start requested but process is not running"
+    return 1
+  fi
+}
+
+apply_profile() {
+  local profile="$1"
+
+  case "$profile" in
+    controller_kbm_generic|youtube_remote|spotify_ui|desktop_mouse)
+      start_antimicrox_profile "$profile"
+      ;;
+
+    none|kodi_native|kodi_native_minimal|passthrough)
+      stop_antimicrox
+      ;;
+  esac
+}
+
+set_profile() {
+  local profile="${1:-}"
+
+  if ! is_valid_profile_name "$profile"; then
+    printf 'tvbox-inputctl: invalid profile name: %s\n' "$profile" >&2
+    return 2
+  fi
+
+  if ! is_known_profile "$profile"; then
+    printf 'tvbox-inputctl: unknown profile: %s\n' "$profile" >&2
+    printf 'Known profiles: %s\n' "$KNOWN_PROFILES" >&2
+    return 2
+  fi
+
+  if ! apply_profile "$profile"; then
+    return 1
+  fi
+
+  printf '%s\n' "$profile" > "$INPUT_PROFILE_FILE"
+  log "input-profile=$profile backend=$BACKEND"
+}
+
+status() {
+  local anti_running anti_pid
+
+  anti_running="no"
+  anti_pid="none"
+  if antimicrox_running; then
+    anti_running="yes"
+    anti_pid="$(cat "$ANTIMICROX_PID_FILE" 2>/dev/null || printf 'unknown')"
+  fi
+
+  cat <<STATUS
+tvbox-inputctl status
+---------------------
+state-dir:         $STATE_DIR
+profile-dir:       $PROFILE_DIR
+input-profile:     $(get_profile)
+backend:           $BACKEND
+antimicrox-bin:    $ANTIMICROX_BIN
+antimicrox-pid:    $anti_pid
+antimicrox-running: $anti_running
+controller-target: ${ANTIMICROX_CONTROLLER:-all}
+dry-run:           $DRY_RUN
+
+known profiles
+--------------
+$KNOWN_PROFILES
+STATUS
+}
+
+cmd="${1:-}"
+
+case "$cmd" in
+  status)
+    status
+    ;;
+
+  get-profile)
+    get_profile
+    ;;
+
+  set-profile)
+    shift
+    if ! with_lock; then
+      log "set-profile ignored because lock is held"
+      exit 0
+    fi
+    set_profile "${1:-}"
+    ;;
+
+  reset)
+    if ! with_lock; then
+      log "reset ignored because lock is held"
+      exit 0
+    fi
+    set_profile "$DEFAULT_PROFILE"
+    ;;
+
+  stop)
+    if ! with_lock; then
+      log "stop ignored because lock is held"
+      exit 0
+    fi
+    set_profile "none"
+    ;;
+
+  list-profiles)
+    printf '%s\n' $KNOWN_PROFILES
+    ;;
+
+  list-controllers)
+    if [ ! -x "$ANTIMICROX_BIN" ]; then
+      printf 'tvbox-inputctl: AntiMicroX not executable: %s\n' "$ANTIMICROX_BIN" >&2
+      exit 1
+    fi
+    "$ANTIMICROX_BIN" --list
+    ;;
+
+  ""|-h|--help|help)
+    usage
+    ;;
+
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

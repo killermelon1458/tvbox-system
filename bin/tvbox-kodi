@@ -6,6 +6,8 @@ LOG="/home/tvbox/.cache/tvbox-kodi.log"
 
 mkdir -p /home/tvbox/.cache
 
+/usr/local/bin/tvbox-inputctl set-profile kodi_native_minimal 2>/tmp/tvbox-inputctl-kodi.log || true
+
 export HOME=/home/tvbox
 export USER=tvbox
 export LOGNAME=tvbox

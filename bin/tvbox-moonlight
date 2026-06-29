@@ -70,6 +70,8 @@ trap cleanup_return_to_kodi EXIT
 log "==== tvbox-moonlight target=$TARGET ===="
 log "HOST=$HOST DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
 
+/usr/local/bin/tvbox-inputctl set-profile passthrough >> "$LOG" 2>&1 || true
+
 case "$TARGET" in
   steam)
     APP="Steam Big Picture"
