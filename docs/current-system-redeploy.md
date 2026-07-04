@@ -71,6 +71,7 @@ Sunshine host apps and undo scripts
 Steam Link pairing/auth state
 Kodi/Plex account setup
 ROM files under /home/tvbox/Games
+Mario Kart 64 ROM at /home/tvbox/Games/ROMs/N64/Mario Kart 64 (USA).z64, if using the Mario Kart launcher
 local network addresses, especially MOONLIGHT_HOST
 audio device names if the HDMI sink changes
 ```
@@ -100,6 +101,8 @@ The important live commands after install are:
 
 Repo-owned Kodi keymaps live under `config/kodi/userdata/keymaps/`. The installer deploys them to `/home/tvbox/.kodi/userdata/keymaps/`. `tvbox-controller-guide.xml` maps the Kodi native controller Guide/Xbox logical button to `ActivateWindow(FavouritesBrowser)` so Kodi can keep native controller input without AntiMicroX duplicate navigation.
 
+Repo-owned Kodi launcher add-ons include YouTube, Moonlight, Steam Link, and Mario Kart 64. The Mario Kart 64 add-on runs `tvboxctl launch mariokart64`, which starts `/usr/local/bin/tvbox-mariokart64`; the wrapper expects the Mupen64Plus binary/plugins and ROM path listed above to exist outside the repo.
+
 Current repo context wiring:
 
 ```text
@@ -107,6 +110,7 @@ Kodi/Home recovery -> kodi_native_minimal
 YouTube Chromium mode -> controller_kbm_generic
 Steam Link -> passthrough
 Moonlight -> passthrough
+Mario Kart 64 -> passthrough
 ```
 
 ## Validation
@@ -131,6 +135,7 @@ Xbox/Guide in Kodi opens Kodi Favourites through the repo-owned Kodi keymap with
 YouTube addon launches Chromium TV mode and returns to Kodi.
 Moonlight addons launch and Home soft-disconnects locally.
 Steam Link addon launches through tvboxctl and Home closes local Steam Link.
+Mario Kart 64 addon launches through tvboxctl and Home/F12 closes Mupen64Plus.
 Spotify connect starts the visible Spotify mode and Home returns to Kodi.
 ```
 
@@ -140,7 +145,7 @@ The future plan docs are not implemented yet. In particular:
 
 ```text
 tvboxctl exit and menu are placeholders.
-Most tvboxctl launch subcommands are placeholders except steamlink.
+Most tvboxctl launch subcommands are placeholders except steamlink and mariokart64.
 Only controller_kbm_generic is currently used as an active AntiMicroX remapping profile.
 Controller-specific profile organization is not implemented yet.
 The installer does not install OS packages or configure external accounts.

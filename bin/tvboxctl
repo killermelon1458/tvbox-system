@@ -23,6 +23,7 @@ MOONLIGHT_STOP_SOFT="/usr/local/bin/tvbox-stop-moonlight"
 MOONLIGHT_STOP_HARD="/usr/local/bin/tvbox-quit-moonlight-session"
 MOONLIGHT_HOST="192.168.1.189"
 STEAMLINK_BIN="/usr/bin/steamlink"
+MARIOKART64_WRAPPER="/usr/local/bin/tvbox-mariokart64"
 INPUTCTL="/usr/local/bin/tvbox-inputctl"
 
 MAX_PRESERVED_APPS=0
@@ -112,7 +113,7 @@ Usage:
   tvboxctl home
   tvboxctl exit
   tvboxctl menu
-  tvboxctl launch <youtube|plex|moonlight> [target]
+  tvboxctl launch <youtube|plex|moonlight|steamlink|mariokart64> [target]
 USAGE
 }
 
@@ -197,6 +198,10 @@ steamlink_process_running() {
 
 steamlink_running() {
   steamlink_window_running || steamlink_process_running
+}
+
+mariokart64_running() {
+  pgrep -x mupen64plus >/dev/null 2>&1
 }
 
 focus_steamlink() {
@@ -284,6 +289,7 @@ youtube-running:   $(bool_word youtube_running)
 spotify-running:   $(bool_word spotify_running)
 moonlight-running: $(bool_word moonlight_running)
 steamlink-running: $(bool_word steamlink_running)
+mariokart64-running: $(bool_word mariokart64_running)
 
 configured paths
 ----------------
@@ -294,6 +300,7 @@ spotify-stop:      $SPOTIFY_STOP
 moonlight-soft:    $MOONLIGHT_STOP_SOFT
 moonlight-hard:    $MOONLIGHT_STOP_HARD
 steamlink-bin:     $STEAMLINK_BIN
+mariokart64:       $MARIOKART64_WRAPPER
 
 config
 ------
@@ -325,6 +332,17 @@ close_youtube_current() {
 
 do_home() {
   log "home requested; context=$(get_context)"
+
+  # Mupen64Plus mode: close the emulator and return to Kodi.
+  if mariokart64_running; then
+    log "home: mariokart64/mupen64plus detected; closing emulator and returning Kodi"
+    pkill -TERM -x mupen64plus 2>/dev/null || true
+    sleep 1
+    show_kodi
+    set_context "kodi"
+    clear_preserved
+    exit 0
+  fi
 
   # Moonlight mode: disconnect local Moonlight client only.
   # This is non-destructive and should not send Sunshine undo.
@@ -452,6 +470,37 @@ do_launch_steamlink() {
   set_context "steamlink"
 }
 
+do_launch_mariokart64() {
+  log "launch mariokart64 requested; context=$(get_context)"
+  set_input_profile "passthrough"
+
+  if mariokart64_running; then
+    log "launch mariokart64: already running"
+    set_context "mariokart64"
+    exit 0
+  fi
+
+  if [ ! -x "$MARIOKART64_WRAPPER" ]; then
+    log "launch mariokart64: wrapper missing or not executable: $MARIOKART64_WRAPPER"
+    printf 'tvboxctl: missing executable: %s\n' "$MARIOKART64_WRAPPER" >&2
+    return 1
+  fi
+
+  log "launch mariokart64: starting $MARIOKART64_WRAPPER"
+  start_bg "$MARIOKART64_WRAPPER"
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    if mariokart64_running; then
+      set_context "mariokart64"
+      exit 0
+    fi
+  done
+
+  log "launch mariokart64: start requested but no mupen64plus process detected"
+  set_context "mariokart64"
+}
+
 evict_preserved() {
   # Phase 1 skeleton only. Real eviction behavior comes later.
   local preserved
@@ -543,6 +592,13 @@ case "$cmd" in
           exit 0
         fi
         do_launch_steamlink
+        ;;
+      mariokart64)
+        if ! with_lock; then
+          log "launch mariokart64 ignored because lock is held"
+          exit 0
+        fi
+        do_launch_mariokart64
         ;;
       *)
         not_implemented "launch ${*:-}"
