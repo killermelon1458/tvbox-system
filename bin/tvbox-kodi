@@ -39,6 +39,7 @@ open_favourites() {
 if kodi_running; then
   log "Kodi already running; opening Favourites."
   open_favourites
+  /usr/local/bin/tvboxctl set-context kodi >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -51,20 +52,27 @@ fi
 if kodi_running; then
   log "Kodi appeared while acquiring launch path; opening Favourites."
   open_favourites
+  /usr/local/bin/tvboxctl set-context kodi >/dev/null 2>&1 || true
   exit 0
 fi
 
 /usr/local/bin/tvbox-audio-hdmi >> "$LOG" 2>&1 || true
 log "Launching Kodi with ALSA backend."
 
-# Critical: close FD 9 in the Kodi child so Kodi does not hold the launch lock.
+# Critical: close FD 9 in the Kodi supervisor so Kodi does not hold the launch lock.
 (
   exec 9>&-
-  exec /usr/bin/kodi -fs --audio-backend=alsa "$@"
+  /usr/bin/kodi -fs --audio-backend=alsa "$@"
+  kodi_rc=$?
+  log "Kodi exited with code $kodi_rc."
+  sleep 2
+  /usr/local/bin/tvboxctl reconcile-context kodi-exited >> "$LOG" 2>&1 || true
+  exit "$kodi_rc"
 ) >> "$LOG" 2>&1 &
 
 kodi_pid=$!
-log "Kodi launch started with PID $kodi_pid."
+log "Kodi supervisor started with PID $kodi_pid."
+/usr/local/bin/tvboxctl set-context kodi >/dev/null 2>&1 || true
 
 sleep 2
 exit 0

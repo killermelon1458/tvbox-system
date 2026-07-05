@@ -71,6 +71,26 @@ set_input_profile() {
   fi
 }
 
+input_profile_for_context() {
+  case "${1:-}" in
+    kodi)
+      printf 'kodi_native_minimal\n'
+      ;;
+    youtube)
+      printf 'controller_kbm_generic\n'
+      ;;
+    spotify)
+      printf 'spotify_ui\n'
+      ;;
+    desktop)
+      printf 'controller_kbm_generic\n'
+      ;;
+    steamlink|moonlight|mariokart64)
+      printf 'passthrough\n'
+      ;;
+  esac
+}
+
 focus_kodi() {
   # Kodi's labwc/wlrctl app_id is capitalized: Kodi
   if command -v wlrctl >/dev/null 2>&1; then
@@ -110,6 +130,7 @@ Usage:
   tvboxctl set-preserved <app>
   tvboxctl clear-preserved
   tvboxctl evict-preserved
+  tvboxctl reconcile-context [reason]
   tvboxctl home
   tvboxctl exit
   tvboxctl menu
@@ -132,6 +153,11 @@ get_context() {
 
 set_context() {
   local ctx="${1:-unknown}"
+  local profile
+
+  profile="$(input_profile_for_context "$ctx")"
+  set_input_profile "$profile"
+
   printf '%s\n' "$ctx" > "$ACTIVE_CONTEXT_FILE"
   log "active-context=$ctx"
 }
@@ -328,6 +354,34 @@ close_youtube_current() {
   fi
 
   return 1
+}
+
+reconcile_context() {
+  local reason="${1:-manual}"
+
+  if mariokart64_running; then
+    log "reconcile-context($reason): mariokart64 detected"
+    set_context "mariokart64"
+  elif moonlight_running; then
+    log "reconcile-context($reason): moonlight detected"
+    set_context "moonlight"
+  elif spotify_running; then
+    log "reconcile-context($reason): spotify detected"
+    set_context "spotify"
+  elif steamlink_running; then
+    log "reconcile-context($reason): steamlink detected"
+    set_context "steamlink"
+  elif youtube_running; then
+    log "reconcile-context($reason): youtube detected"
+    set_context "youtube"
+  elif kodi_running; then
+    log "reconcile-context($reason): kodi detected"
+    set_context "kodi"
+  else
+    log "reconcile-context($reason): no controlled app detected; desktop"
+    set_context "desktop"
+    clear_preserved
+  fi
 }
 
 do_home() {
@@ -568,6 +622,15 @@ case "$cmd" in
       exit 0
     fi
     evict_preserved
+    ;;
+
+  reconcile-context)
+    shift
+    if ! with_lock; then
+      log "reconcile-context ignored because lock is held"
+      exit 0
+    fi
+    reconcile_context "${1:-manual}"
     ;;
 
   home)

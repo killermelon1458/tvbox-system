@@ -107,6 +107,7 @@ Current repo context wiring:
 
 ```text
 Kodi/Home recovery -> kodi_native_minimal
+Kodi GUI close with no controlled app active -> desktop + controller_kbm_generic
 YouTube Chromium mode -> controller_kbm_generic
 Steam Link -> passthrough
 Moonlight -> passthrough
@@ -137,6 +138,7 @@ Moonlight addons launch and Home soft-disconnects locally.
 Steam Link addon launches through tvboxctl and Home closes local Steam Link.
 Mario Kart 64 addon launches through tvboxctl and Home/F12 closes Mupen64Plus.
 Spotify connect starts the visible Spotify mode and Home returns to Kodi.
+Closing Kodi from the Kodi GUI updates `tvboxctl status` to `active-context: desktop` and applies the generic controller keyboard/mouse input profile.
 ```
 
 ## Known Gaps
