@@ -10,7 +10,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")"
 REPO_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 PROFILE_DIR="${TVBOX_INPUTCTL_PROFILE_DIR:-$REPO_DIR/input-profiles}"
 
-KNOWN_PROFILES="none kodi_native kodi_native_minimal passthrough controller_kbm_generic youtube_remote spotify_ui desktop_mouse"
+KNOWN_PROFILES="none kodi_native kodi_native_minimal passthrough controller_kbm_generic youtube_remote spotify_ui desktop_mouse mariokart_n64"
 DEFAULT_PROFILE="kodi_native_minimal"
 BACKEND="${TVBOX_INPUTCTL_BACKEND:-antimicrox}"
 ANTIMICROX_BIN="${TVBOX_ANTIMICROX_BIN:-/usr/bin/antimicrox}"
@@ -96,6 +96,12 @@ is_known_profile() {
 
 profile_file() {
   case "${1:-}" in
+    kodi_native_minimal)
+      printf '%s/kodi_native_minimal.gamecontroller.amgp\n' "$PROFILE_DIR"
+      ;;
+    mariokart_n64)
+      printf '%s/mariokart_n64.gamecontroller.amgp\n' "$PROFILE_DIR"
+      ;;
     controller_kbm_generic|youtube_remote|spotify_ui|desktop_mouse)
       printf '%s/controller_kbm_generic.gamecontroller.amgp\n' "$PROFILE_DIR"
       ;;
@@ -219,11 +225,11 @@ apply_profile() {
   local profile="$1"
 
   case "$profile" in
-    controller_kbm_generic|youtube_remote|spotify_ui|desktop_mouse)
+    kodi_native_minimal|controller_kbm_generic|youtube_remote|spotify_ui|desktop_mouse|mariokart_n64)
       start_antimicrox_profile "$profile"
       ;;
 
-    none|kodi_native|kodi_native_minimal|passthrough)
+    none|kodi_native|passthrough)
       stop_antimicrox
       ;;
   esac

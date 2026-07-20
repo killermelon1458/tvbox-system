@@ -8,6 +8,7 @@ FALLBACK_STATE_DIR="/tmp/tvbox"
 LOG_DIR="/home/tvbox/.cache"
 
 KODI_WRAPPER="/usr/local/bin/tvbox-kodi"
+KODI_JSONRPC_URL="http://127.0.0.1:8080/jsonrpc"
 YOUTUBE_WRAPPER="/usr/local/bin/tvbox-youtube"
 YOUTUBE_PROFILE="/home/tvbox/.config/chromium-tvbox-youtube"
 

@@ -83,6 +83,7 @@ The important live commands after install are:
 ```text
 /usr/local/bin/tvboxctl
 /usr/local/bin/tvbox-home
+/usr/local/bin/tvbox-exit
 /usr/local/bin/tvbox-kodi
 /usr/local/bin/tvbox-youtube
 /usr/local/bin/tvbox-moonlight
@@ -97,11 +98,15 @@ The important live commands after install are:
 
 `tvbox-home` is the global F12 target. It handles the current emergency Mupen64Plus exit path first, then delegates to `tvboxctl home`.
 
-`tvbox-inputctl` records the intended input profile in TVBox runtime state and can control a TVBox-owned AntiMicroX process. `controller_kbm_generic`, `youtube_remote`, `spotify_ui`, and `desktop_mouse` start the generic keyboard/mouse profile. `kodi_native`, `kodi_native_minimal`, `passthrough`, and `none` stop the TVBox-owned AntiMicroX process.
+`tvbox-exit` is the global F5 target. It delegates to `tvboxctl exit`, which closes the current TVBox mode. In Kodi, Exit only opens Favourites when Kodi is not already at Favourites. If Kodi is already at Favourites, Exit closes Kodi to the desktop. Five repeated Exit presses run exit panic recovery: close TVBox-controlled apps, close Kodi, and leave the desktop. Five repeated Home presses run home panic recovery: clean up local foreground apps, hard-restart Kodi, and return to Favourites.
 
-Repo-owned Kodi keymaps live under `config/kodi/userdata/keymaps/`. The installer deploys them to `/home/tvbox/.kodi/userdata/keymaps/`. `tvbox-controller-guide.xml` maps the Kodi native controller Guide/Xbox logical button to `ActivateWindow(FavouritesBrowser)` so Kodi can keep native controller input without AntiMicroX duplicate navigation.
+`tvbox-inputctl` records the intended input profile in TVBox runtime state and can control a TVBox-owned AntiMicroX process. `kodi_native_minimal` starts the minimal Kodi profile, mapping controller Home/Guide to F12 and Back/View to F5. `mariokart_n64` starts the minimal Mario Kart 64 profile, mapping only controller Home/Guide to F12 and Back/View to F5. `controller_kbm_generic`, `youtube_remote`, `spotify_ui`, and `desktop_mouse` start the generic keyboard/mouse profile. `kodi_native`, `passthrough`, and `none` stop the TVBox-owned AntiMicroX process.
+
+Repo-owned Kodi keymaps live under `config/kodi/userdata/keymaps/`. The installer deploys them to `/home/tvbox/.kodi/userdata/keymaps/`. `tvbox-controller-guide.xml` maps the Kodi native controller Guide/Xbox logical button to `ActivateWindow(FavouritesBrowser)` as a Kodi-local fallback.
 
 Repo-owned Kodi launcher add-ons include YouTube, Moonlight, Steam Link, and Mario Kart 64. The Mario Kart 64 add-on runs `tvboxctl launch mariokart64`, which starts `/usr/local/bin/tvbox-mariokart64`; the wrapper expects the Mupen64Plus binary/plugins and ROM path listed above to exist outside the repo.
+
+Kodi mode also applies `kodi_native_minimal.gamecontroller.amgp` through `tvbox-inputctl`. That minimal AntiMicroX profile maps controller Home/Guide to F12 and Back/View to F5 so the labwc global Home and Exit bindings work from Kodi.
 
 Current repo context wiring:
 
@@ -111,7 +116,7 @@ Kodi GUI close with no controlled app active -> desktop + controller_kbm_generic
 YouTube Chromium mode -> controller_kbm_generic
 Steam Link -> passthrough
 Moonlight -> passthrough
-Mario Kart 64 -> passthrough
+Mario Kart 64 -> mariokart_n64
 ```
 
 ## Validation
@@ -121,9 +126,10 @@ After install/reboot:
 ```bash
 readlink -f /usr/local/bin/tvboxctl
 readlink -f /usr/local/bin/tvbox-home
+readlink -f /usr/local/bin/tvbox-exit
 readlink -f /usr/local/bin/tvbox-kodi
 tvboxctl status
-grep -n -A4 -B2 -E 'key="F12"|tvbox-home' /home/tvbox/.config/labwc/rc.xml
+grep -n -A4 -B2 -E 'key="F12"|key="F5"|tvbox-home|tvbox-exit' /home/tvbox/.config/labwc/rc.xml
 systemctl cat raspotify
 ```
 
@@ -132,11 +138,16 @@ Also test from the TV:
 ```text
 Kodi autostarts.
 F12/Home returns to Kodi Favourites.
-Xbox/Guide in Kodi opens Kodi Favourites through the repo-owned Kodi keymap without AntiMicroX duplicate navigation.
+F5/Exit closes the current TVBox mode; in Kodi, it opens Favourites when away from Favourites and closes Kodi when already at Favourites.
+F5/Exit pressed five times runs exit panic recovery and leaves the desktop.
+F12/Home pressed five times runs home panic recovery and hard-restarts Kodi back to Favourites.
+Xbox/Guide in Kodi emits F12 through `kodi_native_minimal`, reaching the global Home binding.
+Controller Back/View in Kodi emits F5 through `kodi_native_minimal` and reaches the global Exit binding.
 YouTube addon launches Chromium TV mode and returns to Kodi.
 Moonlight addons launch and Home soft-disconnects locally.
 Steam Link addon launches through tvboxctl and Home closes local Steam Link.
 Mario Kart 64 addon launches through tvboxctl and Home/F12 closes Mupen64Plus.
+Mario Kart 64 applies `mariokart_n64`, so controller Home/Guide emits F12 and Back/View emits F5 while gameplay controls otherwise remain native.
 Spotify connect starts the visible Spotify mode and Home returns to Kodi.
 Closing Kodi from the Kodi GUI updates `tvboxctl status` to `active-context: desktop` and applies the generic controller keyboard/mouse input profile.
 ```
@@ -146,9 +157,9 @@ Closing Kodi from the Kodi GUI updates `tvboxctl status` to `active-context: des
 The future plan docs are not implemented yet. In particular:
 
 ```text
-tvboxctl exit and menu are placeholders.
+tvboxctl menu is a placeholder.
 Most tvboxctl launch subcommands are placeholders except steamlink and mariokart64.
-Only controller_kbm_generic is currently used as an active AntiMicroX remapping profile.
+Only kodi_native_minimal and controller_kbm_generic are currently used as active AntiMicroX remapping profiles.
 Controller-specific profile organization is not implemented yet.
 The installer does not install OS packages or configure external accounts.
 ```

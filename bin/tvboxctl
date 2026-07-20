@@ -12,6 +12,7 @@ FALLBACK_STATE_DIR="/tmp/tvbox"
 LOG_DIR="/home/tvbox/.cache"
 
 KODI_WRAPPER="/usr/local/bin/tvbox-kodi"
+KODI_JSONRPC_URL="http://127.0.0.1:8080/jsonrpc"
 YOUTUBE_WRAPPER="/usr/local/bin/tvbox-youtube"
 YOUTUBE_PROFILE="/home/tvbox/.config/chromium-tvbox-youtube"
 
@@ -46,10 +47,106 @@ PRESERVED_APP_FILE="$STATE_DIR/preserved-app"
 PRESERVED_SINCE_FILE="$STATE_DIR/preserved-since"
 LOCK_FILE="$STATE_DIR/lock"
 LOG_FILE="$LOG_DIR/tvboxctl.log"
+RECOVERY_LOG_FILE="$LOG_DIR/tvbox-recovery.log"
+HOME_BUTTON_STATE_FILE="$STATE_DIR/button-home-state"
+EXIT_BUTTON_STATE_FILE="$STATE_DIR/button-exit-state"
+LAST_PANIC_FILE="$STATE_DIR/last-panic"
+KODI_FAVOURITES_HINT_FILE="$STATE_DIR/kodi-favourites-hint"
+
+HOME_COUNTER_WINDOW=10
+EXIT_COUNTER_WINDOW=8
+PANIC_PRESS_THRESHOLD=5
 
 log() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
   logger -t tvboxctl "$*" 2>/dev/null || true
+}
+
+log_recovery() {
+  printf '%s %s\n' "$(date -Is 2>/dev/null || date)" "$*" >> "$RECOVERY_LOG_FILE"
+}
+
+button_state_file() {
+  case "${1:-}" in
+    home)
+      printf '%s\n' "$HOME_BUTTON_STATE_FILE"
+      ;;
+    exit)
+      printf '%s\n' "$EXIT_BUTTON_STATE_FILE"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+button_press_count() {
+  local button="${1:-}"
+  local window="${2:-8}"
+  local file now prev_ts prev_count count
+
+  file="$(button_state_file "$button")" || return 1
+  now="$(date +%s)"
+  prev_ts=0
+  prev_count=0
+
+  if [ -r "$file" ]; then
+    read -r prev_ts prev_count < "$file" || true
+  fi
+
+  if [ "$prev_ts" -gt 0 ] 2>/dev/null && [ $((now - prev_ts)) -le "$window" ] 2>/dev/null; then
+    count=$((prev_count + 1))
+  else
+    count=1
+  fi
+
+  printf '%s %s\n' "$now" "$count" > "$file"
+  printf '%s\n' "$count"
+}
+
+clear_button_counters() {
+  rm -f "$HOME_BUTTON_STATE_FILE" "$EXIT_BUTTON_STATE_FILE"
+}
+
+mark_kodi_favourites() {
+  date +%s > "$KODI_FAVOURITES_HINT_FILE" 2>/dev/null || true
+}
+
+clear_kodi_favourites_hint() {
+  rm -f "$KODI_FAVOURITES_HINT_FILE"
+}
+
+kodi_favourites_hint_fresh() {
+  local now hint_ts
+
+  [ -r "$KODI_FAVOURITES_HINT_FILE" ] || return 1
+  now="$(date +%s)"
+  hint_ts="$(cat "$KODI_FAVOURITES_HINT_FILE" 2>/dev/null || printf '0')"
+
+  [ "$hint_ts" -gt 0 ] 2>/dev/null && [ $((now - hint_ts)) -le "$EXIT_COUNTER_WINDOW" ] 2>/dev/null
+}
+
+kodi_at_favourites() {
+  local response
+
+  if command -v curl >/dev/null 2>&1; then
+    response="$(
+      curl -fsS --max-time 1 \
+        -H 'Content-Type: application/json' \
+        --data '{"jsonrpc":"2.0","method":"GUI.GetProperties","params":{"properties":["currentwindow"]},"id":1}' \
+        "$KODI_JSONRPC_URL" 2>/dev/null || true
+    )"
+
+    if printf '%s\n' "$response" | grep -qi '"label"[[:space:]]*:[[:space:]]*"Favourites"'; then
+      return 0
+    fi
+
+    if printf '%s\n' "$response" | grep -q '"id"[[:space:]]*:[[:space:]]*10134'; then
+      return 0
+    fi
+  fi
+
+  kodi_favourites_hint_fresh
 }
 
 start_bg() {
@@ -85,8 +182,11 @@ input_profile_for_context() {
     desktop)
       printf 'controller_kbm_generic\n'
       ;;
-    steamlink|moonlight|mariokart64)
+    steamlink|moonlight)
       printf 'passthrough\n'
+      ;;
+    mariokart64)
+      printf 'mariokart_n64\n'
       ;;
   esac
 }
@@ -112,12 +212,120 @@ show_kodi() {
     if kodi_running; then
       focus_kodi
       focus_kodi
+      mark_kodi_favourites
       return 0
     fi
   done
 
   focus_kodi
   focus_kodi
+  mark_kodi_favourites
+}
+
+close_kodi_to_desktop() {
+  log "exit: closing Kodi to desktop"
+  clear_kodi_favourites_hint
+  kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1 || true
+  sleep 1
+  pkill -TERM -x kodi.bin 2>/dev/null || true
+  pkill -TERM -x kodi 2>/dev/null || true
+  sleep 3
+  pkill -KILL -x kodi.bin 2>/dev/null || true
+  pkill -KILL -x kodi 2>/dev/null || true
+  set_context "desktop"
+  clear_preserved
+}
+
+capture_panic_snapshot() {
+  local stamp snapshot f
+
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  snapshot="$LOG_DIR/tvbox-panic-snapshot-$stamp.log"
+
+  {
+    date -Is 2>/dev/null || date
+    printf '\n--- tvboxctl status ---\n'
+    status || true
+    printf '\n--- kodi processes ---\n'
+    pgrep -a kodi || true
+    pgrep -a kodi.bin || true
+    printf '\n--- chromium tvbox profiles ---\n'
+    pgrep -af 'chromium.*chromium-tvbox' || true
+    printf '\n--- moonlight processes ---\n'
+    pgrep -a moonlight-qt || true
+    pgrep -a moonlight || true
+    printf '\n--- steamlink processes ---\n'
+    pgrep -a steamlink || true
+    printf '\n--- windows ---\n'
+    wlrctl toplevel list 2>/dev/null || wlrctl window list 2>/dev/null || true
+    printf '\n--- HDMI DRM state ---\n'
+    for f in /sys/class/drm/card*-HDMI-A-*/status /sys/class/drm/card*-HDMI-A-*/modes /sys/class/drm/card*-HDMI-A-*/enabled; do
+      [ -e "$f" ] || continue
+      printf -- '--- %s ---\n' "$f"
+      cat "$f" 2>/dev/null || true
+    done
+    printf '\n--- kodi.log tail ---\n'
+    tail -n 80 /home/tvbox/.kodi/temp/kodi.log 2>/dev/null || true
+    printf '\n--- display journal tail ---\n'
+    journalctl -b --no-pager 2>/dev/null | grep -Ei 'vc4|hdmi|cec|drm|wayland|labwc|packet ram|hotplug|disconnect|connect' | tail -n 120 || true
+  } > "$snapshot" 2>&1
+
+  log "panic snapshot: $snapshot"
+  log_recovery "snapshot=$snapshot"
+}
+
+recover_kodi_hard() {
+  log "recover kodi-hard: hard restarting Kodi"
+  kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1 || true
+  pkill -TERM -x kodi.bin 2>/dev/null || true
+  pkill -TERM -x kodi 2>/dev/null || true
+  sleep 4
+  pkill -KILL -x kodi.bin 2>/dev/null || true
+  pkill -KILL -x kodi 2>/dev/null || true
+  sleep 2
+  show_kodi
+  set_context "kodi"
+  clear_preserved
+}
+
+recover_panic_local() {
+  log "recover panic-local requested; context=$(get_context)"
+  log_recovery "button=${1:-unknown} count=${2:-0} context=$(get_context) action=panic-home reason=repeated-press"
+  date -Is 2>/dev/null > "$LAST_PANIC_FILE" || date > "$LAST_PANIC_FILE"
+
+  capture_panic_snapshot
+
+  "$SPOTIFY_STOP" 2>/tmp/tvbox-stop-spotify.log || true
+  close_youtube_current || true
+  close_steamlink_current || true
+  "$MOONLIGHT_STOP_SOFT" 2>/tmp/tvbox-stop-moonlight.log || true
+  pkill -TERM -x mupen64plus 2>/dev/null || true
+  sleep 1
+  pkill -KILL -x mupen64plus 2>/dev/null || true
+
+  recover_kodi_hard
+  clear_button_counters
+}
+
+recover_exit_panic_local() {
+  log "recover exit-panic-local requested; context=$(get_context)"
+  log_recovery "button=${1:-exit} count=${2:-0} context=$(get_context) action=panic-exit reason=repeated-press"
+  date -Is 2>/dev/null > "$LAST_PANIC_FILE" || date > "$LAST_PANIC_FILE"
+
+  capture_panic_snapshot
+
+  "$SPOTIFY_STOP" 2>/tmp/tvbox-stop-spotify.log || true
+  close_youtube_current || true
+  close_steamlink_current || true
+  "$MOONLIGHT_STOP_HARD" 2>/tmp/tvbox-quit-moonlight-session.log || true
+  pkill -TERM -x mupen64plus 2>/dev/null || true
+  sleep 1
+  pkill -KILL -x mupen64plus 2>/dev/null || true
+
+  close_kodi_to_desktop
+  set_context "desktop"
+  clear_preserved
+  clear_button_counters
 }
 
 usage() {
@@ -131,6 +339,7 @@ Usage:
   tvboxctl clear-preserved
   tvboxctl evict-preserved
   tvboxctl reconcile-context [reason]
+  tvboxctl recover <kodi-hard|panic-local|exit-panic-local>
   tvboxctl home
   tvboxctl exit
   tvboxctl menu
@@ -141,6 +350,12 @@ USAGE
 with_lock() {
   exec 9>"$LOCK_FILE"
   flock -n 9
+}
+
+with_lock_wait() {
+  local timeout="${1:-2}"
+  exec 9>"$LOCK_FILE"
+  flock -w "$timeout" 9
 }
 
 get_context() {
@@ -320,6 +535,7 @@ mariokart64-running: $(bool_word mariokart64_running)
 configured paths
 ----------------
 kodi-wrapper:      $KODI_WRAPPER
+kodi-jsonrpc:      $KODI_JSONRPC_URL
 youtube-wrapper:   $YOUTUBE_WRAPPER
 youtube-profile:   $YOUTUBE_PROFILE
 spotify-stop:      $SPOTIFY_STOP
@@ -385,7 +601,15 @@ reconcile_context() {
 }
 
 do_home() {
-  log "home requested; context=$(get_context)"
+  local press_count="${1:-1}"
+
+  log "home requested; context=$(get_context); count=$press_count"
+  log_recovery "button=home count=$press_count context=$(get_context) action=home"
+
+  if [ "$press_count" -ge "$PANIC_PRESS_THRESHOLD" ] 2>/dev/null; then
+    recover_panic_local "home" "$press_count"
+    exit 0
+  fi
 
   # Mupen64Plus mode: close the emulator and return to Kodi.
   if mariokart64_running; then
@@ -449,6 +673,7 @@ do_home() {
     kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1 || true
     sleep 1
     kodi-send --action="ActivateWindow(FavouritesBrowser)" >/dev/null 2>&1 || true
+    mark_kodi_favourites
     show_kodi
     set_context "kodi"
     exit 0
@@ -466,6 +691,91 @@ do_home() {
 
   # Fallback: launch Kodi.
   log "home: no known active app; launching Kodi"
+  show_kodi
+  set_context "kodi"
+}
+
+do_exit() {
+  local press_count="${1:-1}"
+
+  log "exit requested; context=$(get_context); count=$press_count"
+  log_recovery "button=exit count=$press_count context=$(get_context) action=exit"
+
+  if [ "$press_count" -ge "$PANIC_PRESS_THRESHOLD" ] 2>/dev/null; then
+    recover_exit_panic_local "exit" "$press_count"
+    exit 0
+  fi
+
+  if mariokart64_running; then
+    log "exit: mariokart64/mupen64plus detected; closing emulator and returning Kodi"
+    pkill -TERM -x mupen64plus 2>/dev/null || true
+    sleep 1
+    pkill -KILL -x mupen64plus 2>/dev/null || true
+    show_kodi
+    set_context "kodi"
+    clear_preserved
+    exit 0
+  fi
+
+  if moonlight_running; then
+    log "exit: moonlight detected; running destructive Moonlight quit path"
+    "$MOONLIGHT_STOP_HARD" 2>/tmp/tvbox-quit-moonlight-session.log || true
+    sleep 2
+    show_kodi
+    set_context "kodi"
+    clear_preserved
+    exit 0
+  fi
+
+  if spotify_running; then
+    log "exit: spotify mode detected; stopping Spotify and returning Kodi"
+    "$SPOTIFY_STOP" 2>/tmp/tvbox-stop-spotify.log || true
+    sleep 1
+    show_kodi
+    set_context "kodi"
+    clear_preserved
+    exit 0
+  fi
+
+  if steamlink_running; then
+    log "exit: steamlink detected; closing Steam Link and returning Kodi"
+    close_steamlink_current || true
+    sleep 1
+    show_kodi
+    set_context "kodi"
+    clear_preserved
+    exit 0
+  fi
+
+  if youtube_running; then
+    log "exit: youtube detected; closing YouTube Chromium and returning Kodi"
+    close_youtube_current || true
+    sleep 1
+    show_kodi
+    set_context "kodi"
+    clear_preserved
+    exit 0
+  fi
+
+  if kodi_running; then
+    if kodi_at_favourites; then
+      log "exit: kodi is at Favourites; closing Kodi"
+      close_kodi_to_desktop
+      clear_button_counters
+      exit 0
+    fi
+
+    log "exit: kodi detected away from Favourites; opening Favourites"
+    kodi-send --action="PlayerControl(Stop)" >/dev/null 2>&1 || true
+    sleep 1
+    kodi-send --action="ActivateWindow(FavouritesBrowser)" >/dev/null 2>&1 || true
+    mark_kodi_favourites
+    focus_kodi
+    set_context "kodi"
+    exit 0
+  fi
+
+  log "exit: no known active app; launching Kodi"
   show_kodi
   set_context "kodi"
 }
@@ -633,15 +943,53 @@ case "$cmd" in
     reconcile_context "${1:-manual}"
     ;;
 
-  home)
+  recover)
+    shift
     if ! with_lock; then
-      log "home ignored because lock is held"
+      log "recover ${1:-} ignored because lock is held"
       exit 0
     fi
-    do_home
+    case "${1:-}" in
+      kodi-hard)
+        recover_kodi_hard
+        ;;
+      panic-local)
+        recover_panic_local "manual" 0
+        ;;
+      exit-panic-local)
+        recover_exit_panic_local "manual" 0
+        ;;
+      *)
+        not_implemented "recover ${*:-}"
+        ;;
+    esac
     ;;
 
-  exit|menu)
+  home)
+    press_count="$(button_press_count home "$HOME_COUNTER_WINDOW" 2>/dev/null || printf '1')"
+    if ! with_lock; then
+      log "home ignored because lock is held; counted press=$press_count"
+      if [ "$press_count" -ge "$PANIC_PRESS_THRESHOLD" ] 2>/dev/null && with_lock_wait 2; then
+        recover_panic_local "home" "$press_count"
+      fi
+      exit 0
+    fi
+    do_home "$press_count"
+    ;;
+
+  exit)
+    press_count="$(button_press_count exit "$EXIT_COUNTER_WINDOW" 2>/dev/null || printf '1')"
+    if ! with_lock; then
+      log "exit ignored because lock is held; counted press=$press_count"
+      if [ "$press_count" -ge "$PANIC_PRESS_THRESHOLD" ] 2>/dev/null && with_lock_wait 2; then
+        recover_exit_panic_local "exit" "$press_count"
+      fi
+      exit 0
+    fi
+    do_exit "$press_count"
+    ;;
+
+  menu)
     not_implemented "$cmd"
     ;;
 

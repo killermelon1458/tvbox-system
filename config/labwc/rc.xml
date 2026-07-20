@@ -4,6 +4,9 @@
     <keybind key="F12">
       <action name="Execute" command="/usr/local/bin/tvbox-home" />
     </keybind>
+    <keybind key="F5">
+      <action name="Execute" command="/usr/local/bin/tvbox-exit" />
+    </keybind>
   </keyboard>
 
   <libinput>

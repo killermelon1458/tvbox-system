@@ -24,18 +24,18 @@
             <trigger index="6">
                 <throttle>positivehalf</throttle>
             </trigger>
-            <button index="6">
-                <slots>
-                    <slot>
-                        <code>0x100003b</code>
-                        <mode>keyboard</mode>
-                    </slot>
-                </slots>
-            </button>
             <button index="5">
                 <slots>
                     <slot>
                         <code>0x1000034</code>
+                        <mode>keyboard</mode>
+                    </slot>
+                </slots>
+            </button>
+            <button index="6">
+                <slots>
+                    <slot>
+                        <code>0x100003b</code>
                         <mode>keyboard</mode>
                     </slot>
                 </slots>
