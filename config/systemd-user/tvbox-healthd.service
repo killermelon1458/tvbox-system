@@ -1,0 +1,17 @@
+[Unit]
+Description=TVBox passive health diagnostic coordinator
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/tvbox
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/local/bin/tvbox-diag watch
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=tvbox-healthd
+
+[Install]
+WantedBy=graphical-session.target

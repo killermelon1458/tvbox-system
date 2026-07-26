@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Live TV status and bounded CEC activation."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+from typing import Callable
+
+UID = int(os.environ.get("TVBOX_UID", "1000"))
+STATE_DIR = Path(os.environ.get("TVBOX_STATE_DIR", f"/run/user/{UID}/tvbox"))
+CEC_DEVICE = os.environ.get("TVBOX_TV_CEC_DEVICE", "/dev/cec1")
+DRM_CONNECTOR = Path(os.environ.get(
+    "TVBOX_TV_DRM_CONNECTOR", "/sys/class/drm/card1-HDMI-A-2",
+))
+TV_LOGICAL_ADDRESS = os.environ.get("TVBOX_TV_LOGICAL_ADDRESS", "0")
+TVBOX_PHYSICAL_ADDRESS = os.environ.get("TVBOX_TV_PHYSICAL_ADDRESS", "1.0.0.0")
+TVBOX_LOGICAL_ADDRESS = int(os.environ.get("TVBOX_TV_LOGICAL_ADDRESS", "4"))
+ACTIVATE_TIMEOUT = float(os.environ.get("TVBOX_TV_ACTIVATE_TIMEOUT", "45"))
+POLL_INTERVAL = float(os.environ.get("TVBOX_TV_POLL_INTERVAL", "0.5"))
+QUERY_TIMEOUT = float(os.environ.get("TVBOX_TV_QUERY_TIMEOUT", "2"))
+ACTIVE_MARKER = STATE_DIR / "tv-active-source.json"
+
+
+@dataclass
+class CommandResult:
+    ok: bool
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+
+@dataclass
+class TVStatus:
+    timestamp: str
+    state: str
+    drm_status: str
+    drm_enabled: str
+    drm_dpms: str
+    cec_power: str
+    physical_address: str
+    logical_address: int | None
+    active_source: str
+    active: bool | None
+    evidence: list[str]
+
+
+def timestamp() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(errors="replace").strip()
+    except OSError:
+        return "unknown"
+
+
+def run_command(argv: list[str], timeout: float = QUERY_TIMEOUT) -> CommandResult:
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, check=False,
+            errors="replace",
+        )
+        return CommandResult(
+            result.returncode == 0, result.returncode,
+            result.stdout.rstrip(), result.stderr.rstrip(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return CommandResult(False, 124, stdout.rstrip(), stderr.rstrip(), True)
+    except OSError as exc:
+        return CommandResult(False, 127, "", str(exc))
+
+
+def cec_command(*args: str, timeout: float = QUERY_TIMEOUT) -> CommandResult:
+    return run_command(["cec-ctl", "-d", CEC_DEVICE, "--skip-info", *args], timeout)
+
+
+def cec_info_command(*args: str, timeout: float = QUERY_TIMEOUT) -> CommandResult:
+    return run_command(["cec-ctl", "-d", CEC_DEVICE, *args], timeout)
+
+
+def parse_power(text: str) -> str:
+    match = re.search(r"pwr-state:\s+(on|standby|to-on|to-standby)", text)
+    return match.group(1) if match else "unknown"
+
+
+def parse_adapter(text: str) -> tuple[str, int | None]:
+    physical = "unknown"
+    logical: int | None = None
+    physical_match = re.search(r"Physical Address\s+:\s+([0-9a-f.]+)", text, re.I)
+    if physical_match:
+        physical = physical_match.group(1).lower()
+    logical_match = re.search(r"Logical Address\s+:\s+(\d+)", text)
+    if logical_match:
+        logical = int(logical_match.group(1))
+    return physical, logical
+
+
+def parse_active_source(text: str) -> str:
+    marker = text.rfind("ACTIVE_SOURCE")
+    if marker < 0:
+        return "unknown"
+    match = re.search(r"phys-addr:\s+([0-9a-f.]+)", text[marker:], re.I)
+    return match.group(1).lower() if match else "unknown"
+
+
+def classify(
+    drm_status: str, drm_enabled: str, drm_dpms: str, cec_power: str,
+    physical: str, logical: int | None,
+) -> tuple[str, list[str]]:
+    evidence: list[str] = []
+    if drm_status == "connected":
+        evidence.append("drm_connected")
+    elif drm_status == "disconnected":
+        evidence.append("drm_disconnected")
+    if cec_power != "unknown":
+        evidence.append(f"cec_power_{cec_power}")
+    if physical == TVBOX_PHYSICAL_ADDRESS and logical == TVBOX_LOGICAL_ADDRESS:
+        evidence.append("cec_playback_ready")
+
+    if cec_power == "standby":
+        return "standby", evidence
+    if cec_power in {"to-on", "to-standby"}:
+        return "transitioning", evidence
+    if (
+        drm_status == "connected" and drm_enabled == "enabled"
+        and drm_dpms == "On" and cec_power == "on"
+        and physical == TVBOX_PHYSICAL_ADDRESS
+        and logical == TVBOX_LOGICAL_ADDRESS
+    ):
+        return "on", evidence
+    if drm_status == "disconnected" and cec_power == "unknown":
+        return "unavailable", evidence
+    if drm_status == "disconnected" or physical in {"f.f.f.f", "unknown"}:
+        return "transitioning", evidence
+    return "unknown", evidence
+
+
+def observe_status(
+    runner: Callable[..., CommandResult] = cec_command,
+    info_runner: Callable[..., CommandResult] = cec_info_command,
+    cache: bool = True,
+) -> TVStatus:
+    drm_status = read_text(DRM_CONNECTOR / "status")
+    drm_enabled = read_text(DRM_CONNECTOR / "enabled")
+    drm_dpms = read_text(DRM_CONNECTOR / "dpms")
+
+    power_result = runner(
+        "--to", TV_LOGICAL_ADDRESS, "--give-device-power-status",
+        timeout=QUERY_TIMEOUT,
+    )
+    cec_power = parse_power(f"{power_result.stdout}\n{power_result.stderr}")
+
+    adapter_result = info_runner("--logical-addresses", timeout=QUERY_TIMEOUT)
+    physical, logical = parse_adapter(
+        f"{adapter_result.stdout}\n{adapter_result.stderr}"
+    )
+
+    active_result = runner("--request-active-source", timeout=QUERY_TIMEOUT)
+    active_source = parse_active_source(
+        f"{active_result.stdout}\n{active_result.stderr}"
+    )
+    marker_active = read_active_marker()
+    if active_source not in {"unknown", TVBOX_PHYSICAL_ADDRESS}:
+        clear_active_marker()
+        marker_active = False
+    if (
+        active_source == "unknown" and marker_active
+        and drm_status == "connected"
+        and cec_power == "on"
+        and physical == TVBOX_PHYSICAL_ADDRESS
+        and logical == TVBOX_LOGICAL_ADDRESS
+    ):
+        active_source = TVBOX_PHYSICAL_ADDRESS
+    active: bool | None = (
+        active_source == physical
+        if active_source != "unknown" and physical not in {"unknown", "f.f.f.f"}
+        else None
+    )
+    state, evidence = classify(
+        drm_status, drm_enabled, drm_dpms, cec_power, physical, logical,
+    )
+    if marker_active and active_source == TVBOX_PHYSICAL_ADDRESS:
+        evidence.append("local_active_source_sent")
+    if drm_status != "connected" or cec_power in {"standby", "to-standby"}:
+        clear_active_marker()
+    status = TVStatus(
+        timestamp(), state, drm_status, drm_enabled, drm_dpms, cec_power,
+        physical, logical, active_source, active, evidence,
+    )
+    if cache:
+        write_cache(status)
+    return status
+
+
+def write_cache(status: TVStatus) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = STATE_DIR / f".tv-state.{os.getpid()}.tmp"
+        temporary.write_text(json.dumps(asdict(status), sort_keys=True) + "\n")
+        temporary.replace(STATE_DIR / "tv-state.json")
+    except OSError:
+        pass
+
+
+def read_active_marker() -> bool:
+    try:
+        data = json.loads(ACTIVE_MARKER.read_text(errors="replace"))
+        return (
+            data.get("physical_address") == TVBOX_PHYSICAL_ADDRESS
+            and data.get("logical_address") == TVBOX_LOGICAL_ADDRESS
+        )
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def write_active_marker() -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        ACTIVE_MARKER.write_text(json.dumps({
+            "timestamp": timestamp(),
+            "physical_address": TVBOX_PHYSICAL_ADDRESS,
+            "logical_address": TVBOX_LOGICAL_ADDRESS,
+        }, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def clear_active_marker() -> None:
+    try:
+        ACTIVE_MARKER.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def ready(status: TVStatus) -> bool:
+    return (
+        status.state == "on"
+        and status.physical_address == TVBOX_PHYSICAL_ADDRESS
+        and status.logical_address == TVBOX_LOGICAL_ADDRESS
+    )
+
+
+def send_image_view_on() -> CommandResult:
+    return cec_command(
+        "--verbose", "--to", TV_LOGICAL_ADDRESS, "--image-view-on",
+        timeout=QUERY_TIMEOUT,
+    )
+
+
+def send_active_source() -> CommandResult:
+    return cec_command(
+        "--verbose", "--active-source",
+        f"phys-addr={TVBOX_PHYSICAL_ADDRESS}", timeout=QUERY_TIMEOUT,
+    )
+
+
+def output_status(status: TVStatus, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(asdict(status), sort_keys=True))
+        return
+    print(f"state: {status.state}")
+    print(f"drm: {status.drm_status}")
+    print(f"drm-enabled: {status.drm_enabled}")
+    print(f"drm-dpms: {status.drm_dpms}")
+    print(f"cec-power: {status.cec_power}")
+    print(f"physical-address: {status.physical_address}")
+    print(f"logical-address: {status.logical_address if status.logical_address is not None else 'unknown'}")
+    print(f"active-source: {status.active_source}")
+    active = "unknown" if status.active is None else ("yes" if status.active else "no")
+    print(f"active: {active}")
+    print(f"evidence: {','.join(status.evidence) if status.evidence else 'none'}")
+    print(f"timestamp: {status.timestamp}")
+
+
+def emit_activate(event: str, json_output: bool, **details: object) -> None:
+    record = {"timestamp": timestamp(), "event": event, "details": details}
+    if json_output:
+        print(json.dumps(record, sort_keys=True), flush=True)
+    else:
+        suffix = " ".join(f"{key}={value}" for key, value in details.items())
+        print(f"{event}{' ' + suffix if suffix else ''}", flush=True)
+
+
+def activate(json_output: bool = False) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = STATE_DIR / "tv-activate.lock"
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            emit_activate("activation_in_progress", json_output)
+            return 0
+
+        initial = observe_status()
+        if ready(initial) and initial.active is True:
+            emit_activate(
+                "already_active", json_output, state=initial.state,
+                active_source=initial.active_source,
+            )
+            return 0
+
+        wake = send_image_view_on()
+        emit_activate(
+            "wake_sent", json_output, ok=wake.ok,
+            returncode=wake.returncode,
+        )
+        deadline = time.monotonic() + ACTIVATE_TIMEOUT
+        last = initial
+        while time.monotonic() < deadline:
+            last = observe_status()
+            if ready(last):
+                active_result = send_active_source()
+                emit_activate(
+                    "active_source_sent", json_output, ok=active_result.ok,
+                    returncode=active_result.returncode,
+                    physical_address=last.physical_address,
+                    logical_address=last.logical_address,
+                )
+                if active_result.ok:
+                    write_active_marker()
+                time.sleep(0.5)
+                final = observe_status()
+                emit_activate(
+                    "activated", json_output, state=final.state,
+                    active_source=final.active_source,
+                )
+                return 0
+            time.sleep(POLL_INTERVAL)
+
+        emit_activate(
+            "activation_timeout", json_output, timeout_seconds=ACTIVATE_TIMEOUT,
+            state=last.state, drm=last.drm_status,
+            physical_address=last.physical_address,
+            logical_address=last.logical_address,
+        )
+        return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("status", "activate"))
+    parser.add_argument("--json", action="store_true", dest="json_output")
+    args = parser.parse_args()
+    if args.command == "status":
+        output_status(observe_status(), args.json_output)
+        return 0
+    return activate(args.json_output)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

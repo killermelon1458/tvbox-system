@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Narrow HDMI reconnect recovery for the intended Kodi foreground."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import subprocess
+import sys
+import time
+from typing import Callable
+
+UID = int(os.environ.get("TVBOX_UID", "1000"))
+STATE_DIR = Path(os.environ.get("TVBOX_STATE_DIR", f"/run/user/{UID}/tvbox"))
+CONNECTOR = Path(os.environ.get(
+    "TVBOX_FOCUS_CONNECTOR", "/sys/class/drm/card1-HDMI-A-2/status",
+))
+DEBOUNCE_SECONDS = float(os.environ.get("TVBOX_FOCUS_DEBOUNCE_SECONDS", "1.0"))
+RETRY_SECONDS = float(os.environ.get("TVBOX_FOCUS_RETRY_SECONDS", "1.0"))
+RATE_LIMIT_SECONDS = float(os.environ.get("TVBOX_FOCUS_RATE_LIMIT_SECONDS", "3.0"))
+ALLOWED_CONTEXTS = {"kodi", "plex"}
+EXTERNAL_PROCESSES = {
+    "chromium-tvbox": "youtube",
+    "spotify": "spotify",
+    "moonlight": "moonlight",
+    "steamlink": "steamlink",
+    "mupen64plus": "mariokart64",
+}
+
+
+def emit(event: str, **details: object) -> None:
+    print(json.dumps({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "event": event,
+        "details": details,
+    }, sort_keys=True), flush=True)
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def process_rows() -> list[str]:
+    result = subprocess.run(
+        ["ps", "-eo", "comm=,args="], capture_output=True, text=True,
+        timeout=3, check=False,
+    )
+    return result.stdout.splitlines() if result.returncode == 0 else []
+
+
+def external_app(rows: list[str]) -> str | None:
+    for row in rows:
+        lower = row.lower()
+        for needle, name in EXTERNAL_PROCESSES.items():
+            if needle in lower:
+                return name
+    return None
+
+
+def kodi_running(rows: list[str]) -> bool:
+    for row in rows:
+        parts = row.split(maxsplit=1)
+        comm = parts[0] if parts else ""
+        args = parts[1] if len(parts) > 1 else ""
+        if comm == "kodi.bin" or re.search(r"(^| )/[^ ]*/kodi\.bin(?: |$)", args):
+            return True
+        if re.search(r"(^| )/usr/bin/kodi(?: |$)", args):
+            return True
+    return False
+
+
+def wayland_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{UID}")
+    env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    return env
+
+
+def kodi_toplevel() -> bool:
+    if not shutil.which("wlrctl"):
+        return False
+    result = subprocess.run(
+        ["wlrctl", "toplevel", "list"], capture_output=True, text=True,
+        timeout=3, env=wayland_env(), check=False,
+    )
+    return result.returncode == 0 and any(
+        line.startswith("Kodi:") for line in result.stdout.splitlines()
+    )
+
+
+def recovery_gate(rows: list[str] | None = None) -> tuple[bool, str]:
+    context = read_text(STATE_DIR / "active-context")
+    if context not in ALLOWED_CONTEXTS:
+        return False, f"context:{context or 'unknown'}"
+    if read_text(CONNECTOR) != "connected":
+        return False, "connector_not_connected"
+    rows = process_rows() if rows is None else rows
+    active = external_app(rows)
+    if active:
+        return False, f"external_app:{active}"
+    if not kodi_running(rows):
+        return False, "kodi_not_running"
+    if not kodi_toplevel():
+        return False, "kodi_toplevel_not_ready"
+    return True, "ready"
+
+
+def focus_kodi() -> bool:
+    result = subprocess.run(
+        ["wlrctl", "toplevel", "focus", "app_id:Kodi"],
+        capture_output=True, text=True, timeout=3, env=wayland_env(), check=False,
+    )
+    if result.returncode != 0:
+        emit("focus_failed", returncode=result.returncode, stderr=result.stderr[-512:])
+        return False
+    emit("focus_asserted", selector="app_id:Kodi")
+    return True
+
+
+def run_monitor(
+    clock: Callable[[], float] = time.monotonic,
+) -> int:
+    monitor = subprocess.Popen(
+        ["udevadm", "monitor", "--udev", "--subsystem-match=drm", "--property"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert monitor.stdout is not None
+    deadline: float | None = None
+    retry_deadline: float | None = None
+    last_focus = float("-inf")
+    pending = b""
+    emit("started", connector=str(CONNECTOR), debounce_seconds=DEBOUNCE_SECONDS)
+
+    while monitor.poll() is None:
+        now = clock()
+        wait_until = min(
+            [value for value in (deadline, retry_deadline) if value is not None],
+            default=now + 1,
+        )
+        ready, _, _ = select.select([monitor.stdout], [], [], max(0, wait_until - now))
+        if ready:
+            chunk = os.read(monitor.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            pending += chunk
+            while b"\n\n" in pending:
+                raw_block, pending = pending.split(b"\n\n", 1)
+                fields = set(raw_block.decode(errors="replace").splitlines())
+                if "ACTION=change" in fields and "HOTPLUG=1" in fields:
+                    deadline = clock() + DEBOUNCE_SECONDS
+                    retry_deadline = None
+                    emit("drm_hotplug", debounce_seconds=DEBOUNCE_SECONDS)
+            continue
+
+        now = clock()
+        due_retry = retry_deadline is not None and now >= retry_deadline
+        due_initial = deadline is not None and now >= deadline
+        if not due_initial and not due_retry:
+            continue
+        deadline = None
+        retry_deadline = None
+        if now - last_focus < RATE_LIMIT_SECONDS:
+            emit("focus_skipped", reason="rate_limited")
+            continue
+        allowed, reason = recovery_gate()
+        if allowed:
+            if focus_kodi():
+                last_focus = now
+        else:
+            emit("focus_skipped", reason=reason)
+            if reason in {"connector_not_connected", "kodi_toplevel_not_ready"} and not due_retry:
+                retry_deadline = now + RETRY_SECONDS
+                emit("retry_scheduled", delay_seconds=RETRY_SECONDS)
+
+    stderr = monitor.stderr.read().decode(errors="replace") if monitor.stderr else ""
+    emit("monitor_exited", returncode=monitor.returncode, stderr=stderr[-512:])
+    return monitor.returncode or 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(run_monitor())
+    except KeyboardInterrupt:
+        raise SystemExit(0)

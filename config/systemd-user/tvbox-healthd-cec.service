@@ -1,0 +1,15 @@
+[Unit]
+Description=TVBox passive CEC diagnostic source
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/tvbox
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/local/bin/tvbox-diag cec-watch
+Restart=on-failure
+RestartSec=10
+SyslogIdentifier=tvbox-healthd-cec
+
+# Intentionally no [Install] section: enable only after coexistence testing.

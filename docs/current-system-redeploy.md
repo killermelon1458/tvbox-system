@@ -94,6 +94,7 @@ The important live commands after install are:
 /usr/local/bin/tvbox-audio-gamesir
 /usr/local/bin/tvbox-mariokart64
 /usr/local/bin/tvbox-inputctl
+/usr/local/bin/tvbox-diag
 ```
 
 `tvbox-home` is the global F12 target. It handles the current emergency Mupen64Plus exit path first, then delegates to `tvboxctl home`.
@@ -118,6 +119,136 @@ Steam Link -> passthrough
 Moonlight -> passthrough
 Mario Kart 64 -> mariokart_n64
 ```
+
+## Passive Diagnostics (Installed, Not Automatically Enabled)
+
+The repo contains the observation-only `tvbox-diag` CLI and two user units:
+
+```text
+tvbox-healthd.service       periodic coordinator plus passive DRM/input udev source
+tvbox-healthd-cec.service   separate passive CEC monitor
+```
+
+The installer deploys the CLI, example-derived user configuration, and units,
+but does not enable or start either observer. The CEC unit intentionally has no
+`[Install]` section until adapter coexistence is validated.
+
+Start a temporary session:
+
+```bash
+systemctl --user start tvbox-healthd.service
+journalctl --user-unit=tvbox-healthd.service -f
+```
+
+Or run the faster foreground diagnostic mode:
+
+```bash
+tvbox-diag watch --diagnostic
+```
+
+Create a passive snapshot or bounded allowlisted bundle:
+
+```bash
+tvbox-diag snapshot
+tvbox-diag bundle
+```
+
+Stop all observers:
+
+```bash
+systemctl --user disable --now tvbox-healthd.service tvbox-healthd-cec.service
+```
+
+Discovery limitations and manual tests are recorded in
+`docs/tvbox-focus-cec-diagnostic-discovery.md` and
+`docs/tvbox-focus-cec-diagnostic-tests.md`.
+
+## HDMI Kodi Focus Recovery
+
+The installer deploys:
+
+```text
+/usr/local/bin/tvbox-focusd
+/home/tvbox/.config/systemd/user/tvbox-focus-recovery.service
+```
+
+The recovery service watches DRM hotplug events separately from the passive
+diagnostic service. After the final event is stable for one second, it asserts
+focus on exact Wayland app ID `Kodi` only when:
+
+- HDMI-A-2 is connected;
+- active context is Kodi or Plex;
+- Kodi is running and listed as a Wayland toplevel; and
+- no controlled YouTube, Spotify, Moonlight, Steam Link, or Mario Kart process
+  is running.
+
+It retries once when the connector/toplevel is not ready and rate-limits focus
+assertions to one per three seconds. It does not restart Kodi, close PCManFM,
+change input profiles, or send CEC commands.
+
+The unit is installed but is not automatically enabled. Start it for testing:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user start tvbox-focus-recovery.service
+systemctl --user status tvbox-focus-recovery.service
+journalctl --user-unit=tvbox-focus-recovery.service -f
+```
+
+After validated TV off/on testing, enable it across login/reboot:
+
+```bash
+systemctl --user enable tvbox-focus-recovery.service
+```
+
+On this installation, user-unit output is stored in the system journal.
+`journalctl --user -u ...` reports that no per-user journal files exist; use
+`journalctl --user-unit=...` instead.
+
+## TV Status and Activation
+
+The installer links:
+
+```text
+/usr/local/bin/tvbox-tv -> /opt/tvbox-system/bin/tvbox-tv
+```
+
+Available commands:
+
+```bash
+tvbox-tv status
+tvbox-tv status --json
+tvbox-tv activate
+```
+
+`status` performs fresh bounded DRM and CEC checks. It reports TV state, HDMI
+connection/enabled/DPMS state, CEC power, physical and logical addresses, active
+source, evidence, and timestamp. Its state values are:
+
+```text
+on
+standby
+transitioning
+unavailable
+unknown
+```
+
+`activate` is an idempotent ensure-active operation:
+
+1. Coalesce concurrent calls with a runtime lock.
+2. Return immediately if the TVBox is already on and active.
+3. Otherwise send CEC `IMAGE_VIEW_ON`.
+4. Wait up to 45 seconds for HDMI-A-2, CEC power on, physical address
+   `1.0.0.0`, and Playback logical address 4.
+5. Broadcast `ACTIVE_SOURCE` only after CEC readiness returns.
+
+The command does not focus or restart Kodi, change input profiles, power off the
+TV, or suspend/shut down the Pi. Kodi's CEC action for TV switch-off must remain
+`Ignore`.
+
+The Hisense TV took 27.285 seconds in the validated TV-off activation test.
+Activation completed with connected HDMI, CEC power on, Playback address 4, and
+active source `1.0.0.0`, inside the 45-second limit.
 
 ## Validation
 

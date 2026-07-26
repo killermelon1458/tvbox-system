@@ -69,6 +69,16 @@ else
 fi
 
 echo
+echo "Installing passive diagnostic config..."
+if [ ! -f "$TVBOX_HOME/.config/tvbox/tvbox-diag.conf" ]; then
+  install_file "$REPO_DIR/config/tvbox-diag.conf.example" \
+    "$TVBOX_HOME/.config/tvbox/tvbox-diag.conf" 0644 "$TVBOX_USER:$TVBOX_USER"
+  echo "Installed user tvbox-diag config from example."
+else
+  echo "Keeping existing user tvbox-diag config."
+fi
+
+echo
 echo "Installing labwc config..."
 install_file "$REPO_DIR/config/labwc/rc.xml" "$TVBOX_HOME/.config/labwc/rc.xml" 0664 "$TVBOX_USER:$TVBOX_USER"
 if [ -f "$REPO_DIR/config/labwc/environment" ]; then
@@ -87,7 +97,11 @@ echo
 echo "Installing user systemd units..."
 if [ -d "$REPO_DIR/config/systemd-user" ]; then
   find "$REPO_DIR/config/systemd-user" -maxdepth 1 -type f -name '*.service' | sort | while read -r unit; do
-    install_file "$unit" "$TVBOX_HOME/.config/systemd/user/$(basename "$unit")" 0644 "$TVBOX_USER:$TVBOX_USER"
+    unit_dst="$TVBOX_HOME/.config/systemd/user/$(basename "$unit")"
+    if [ -e "$unit_dst" ] && ! cmp -s "$unit" "$unit_dst"; then
+      backup_path "$unit_dst"
+    fi
+    install_file "$unit" "$unit_dst" 0644 "$TVBOX_USER:$TVBOX_USER"
   done
 fi
 
@@ -134,3 +148,5 @@ echo "Recommended next steps:"
 echo "  1. Review /etc/tvboxctl.conf for local IPs/paths."
 echo "  2. Reboot or restart the desktop session so labwc and autostart changes load."
 echo "  3. Run: tvboxctl status"
+echo "  4. Diagnostics are installed but not enabled. Start explicitly with:"
+echo "     systemctl --user start tvbox-healthd.service"

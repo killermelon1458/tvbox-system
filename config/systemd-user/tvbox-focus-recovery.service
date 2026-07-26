@@ -1,0 +1,19 @@
+[Unit]
+Description=TVBox HDMI Kodi focus recovery
+After=default.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/tvbox
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=TVBOX_FOCUS_DEBOUNCE_SECONDS=1.0
+Environment=TVBOX_FOCUS_RETRY_SECONDS=1.0
+Environment=TVBOX_FOCUS_RATE_LIMIT_SECONDS=3.0
+ExecStart=/usr/local/bin/tvbox-focusd
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=tvbox-focus-recovery
+
+[Install]
+WantedBy=default.target

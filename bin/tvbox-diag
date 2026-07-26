@@ -1,0 +1,884 @@
+#!/usr/bin/env python3
+"""Observation-only TVBox health diagnostics."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import glob
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from typing import Any
+
+UID = int(os.environ.get("TVBOX_UID", "1000"))
+HOME = Path(os.environ.get("HOME", "/home/tvbox"))
+STATE_DIR = Path(os.environ.get("TVBOX_STATE_DIR", f"/run/user/{UID}/tvbox"))
+CONFIGS = [Path("/etc/tvbox-diag.conf"), HOME / ".config/tvbox/tvbox-diag.conf"]
+REPO = Path(__file__).resolve().parent.parent
+CACHE = Path(os.environ.get("TVBOX_DIAG_CACHE", HOME / ".cache/tvbox-diag"))
+KODI_LOG = HOME / ".kodi/temp/kodi.log"
+VALID_CONTEXTS = {
+    "kodi", "plex", "youtube", "spotify", "moonlight", "steamlink",
+    "mariokart64", "desktop", "unknown",
+}
+VALID_PROFILES = {
+    "none", "kodi_native", "kodi_native_minimal", "passthrough",
+    "controller_kbm_generic", "youtube_remote", "spotify_ui",
+    "desktop_mouse", "mariokart_n64", "unknown",
+}
+DEFAULTS: dict[str, Any] = {
+    "POLL_INTERVAL": 15.0,
+    "DIAGNOSTIC_POLL_INTERVAL": 2.0,
+    "HEARTBEAT_INTERVAL": 300.0,
+    "SNAPSHOT_RATE_LIMIT": 300.0,
+    "LOCK_HELD_THRESHOLD": 30.0,
+    "CONTROLLER_SETTLE_INTERVAL": 5.0,
+    "SNAPSHOT_RETENTION": 12,
+    "JOURNAL_LINES": 250,
+    "KODI_LOG_LINES": 200,
+    "CEC_DEVICE": "auto",
+    "CEC_QUERY_ENABLED": 0,
+    "CEC_QUERY_INTERVAL": 60.0,
+}
+
+
+def load_config() -> dict[str, Any]:
+    cfg = dict(DEFAULTS)
+    for path in CONFIGS:
+        if not path.is_file():
+            continue
+        for raw in path.read_text(errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key not in cfg:
+                continue
+            old = cfg[key]
+            try:
+                cfg[key] = int(value) if isinstance(old, int) else (
+                    float(value) if isinstance(old, float) else value
+                )
+            except ValueError:
+                pass
+    return cfg
+
+
+CFG = load_config()
+
+
+def wall_time() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def mono_time() -> float:
+    return round(time.monotonic(), 3)
+
+
+def read_text(path: Path, limit: int = 65536) -> str | None:
+    try:
+        return path.read_text(errors="replace")[:limit].strip()
+    except (OSError, PermissionError):
+        return None
+
+
+def run(argv: list[str], timeout: float = 5.0, env: dict[str, str] | None = None) -> dict[str, Any]:
+    if not shutil.which(argv[0]) and not Path(argv[0]).exists():
+        return {"available": False, "ok": False, "error": "command_not_found", "argv": argv}
+    try:
+        cp = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, env=env,
+            errors="replace", check=False,
+        )
+        return {
+            "available": True, "ok": cp.returncode == 0, "returncode": cp.returncode,
+            "stdout": cp.stdout.rstrip(), "stderr": cp.stderr.rstrip(),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {"available": True, "ok": False, "error": "timeout",
+                "stdout": (exc.stdout or "")[-4096:], "stderr": (exc.stderr or "")[-4096:]}
+    except OSError as exc:
+        return {"available": True, "ok": False, "error": str(exc)}
+
+
+def context() -> str:
+    return read_text(STATE_DIR / "active-context", 256) or "unknown"
+
+
+def profile() -> str:
+    return read_text(STATE_DIR / "input-profile", 256) or "unknown"
+
+
+def record(source: str, event_type: str, severity: str, details: Any,
+           ctx: str | None = None, prof: str | None = None) -> dict[str, Any]:
+    return {
+        "timestamp": wall_time(),
+        "monotonic_timestamp": mono_time(),
+        "source": source,
+        "event_type": event_type,
+        "severity": severity,
+        "active_context": ctx if ctx is not None else context(),
+        "input_profile": prof if prof is not None else profile(),
+        "details": details,
+    }
+
+
+def emit(source: str, event_type: str, severity: str, details: Any) -> None:
+    print(json.dumps(record(source, event_type, severity, details), sort_keys=True), flush=True)
+
+
+def proc_rows() -> list[dict[str, Any]]:
+    wanted = re.compile(
+        r"kodi|chromium.*chromium-tvbox|spotify|moonlight|steamlink|"
+        r"antimicrox|packagekit|keyring|orca|pcmanfm|thunar|nautilus|"
+        r"zenity|yad|accessib|mupen64", re.I,
+    )
+    rows: list[dict[str, Any]] = []
+    for item in glob.glob("/proc/[0-9]*"):
+        pid = Path(item).name
+        cmd = read_text(Path(item) / "cmdline", 8192)
+        if cmd is None:
+            continue
+        cmd = cmd.replace("\0", " ").strip()
+        comm = read_text(Path(item) / "comm", 256) or ""
+        if wanted.search(f"{comm} {cmd}"):
+            rows.append({"pid": int(pid), "comm": comm, "cmdline": cmd})
+    return sorted(rows, key=lambda x: x["pid"])
+
+
+def proc_present(rows: list[dict[str, Any]], pattern: str) -> bool:
+    rx = re.compile(pattern, re.I)
+    return any(rx.search(f"{r['comm']} {r['cmdline']}") for r in rows)
+
+
+def gui_env() -> dict[str, str]:
+    env = dict(os.environ)
+    runtime = env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{UID}")
+    if not env.get("WAYLAND_DISPLAY"):
+        sockets = sorted(Path(runtime).glob("wayland-*"))
+        for sock in sockets:
+            if sock.is_socket():
+                env["WAYLAND_DISPLAY"] = sock.name
+                break
+    return env
+
+
+def wayland_state() -> dict[str, Any]:
+    env = gui_env()
+    wl = env.get("WAYLAND_DISPLAY")
+    result: dict[str, Any] = {
+        "display": wl, "connected": False, "toplevels": [],
+        "focus": {"state": "unknown", "reason": "tool_does_not_expose_activation"},
+    }
+    if not wl:
+        result["error"] = "no_wayland_socket"
+        return result
+    out = run(["wlrctl", "toplevel", "list"], 3, env)
+    result["raw"] = out
+    if not out.get("ok"):
+        result["error"] = "wlrctl_unavailable_or_cannot_connect"
+        return result
+    result["connected"] = True
+    for line in out.get("stdout", "").splitlines():
+        if not line.strip():
+            continue
+        app_id, sep, title = line.partition(": ")
+        result["toplevels"].append({
+            "app_id": app_id.strip() if sep else "unknown",
+            "title": title.strip() if sep else line.strip(),
+            "activated": None,
+        })
+    return result
+
+
+def lock_state(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {"path": str(path), "present": path.exists(), "held": False}
+    if not path.exists():
+        return result
+    try:
+        st = path.stat()
+        result.update({"mtime": dt.datetime.fromtimestamp(st.st_mtime).astimezone().isoformat(),
+                       "file_age_seconds": round(max(0, time.time() - st.st_mtime), 3)})
+        with path.open("a") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except BlockingIOError:
+                result["held"] = True
+        if result["held"]:
+            owners = run(["lslocks", "-n", "-o", "PID,COMMAND,PATH"], 2)
+            result["owner_probe"] = owners
+    except (OSError, PermissionError) as exc:
+        result["error"] = str(exc)
+        result["held"] = None
+    return result
+
+
+def kodi_rpc() -> dict[str, Any]:
+    calls = [
+        ("ping", "JSONRPC.Ping", {}),
+        ("gui", "GUI.GetProperties", {"properties": ["currentwindow", "currentcontrol"]}),
+        ("players", "Player.GetActivePlayers", {}),
+    ]
+    result: dict[str, Any] = {"available": False, "queries": {}}
+    for name, method, params in calls:
+        payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": name})
+        reply = run(["curl", "-fsS", "--max-time", "2", "-H", "Content-Type: application/json",
+                     "--data", payload, "http://127.0.0.1:8080/jsonrpc"], 3)
+        if reply.get("ok"):
+            try:
+                parsed = json.loads(reply["stdout"])
+            except (ValueError, KeyError):
+                parsed = {"parse_error": True, "raw": reply.get("stdout", "")}
+            result["queries"][name] = parsed
+            result["available"] = True
+        else:
+            result["queries"][name] = {"unavailable": True, "error": reply.get("error") or reply.get("stderr")}
+    players = result["queries"].get("players", {}).get("result", [])
+    for player in players if isinstance(players, list) else []:
+        player_id = player.get("playerid")
+        if not isinstance(player_id, int):
+            continue
+        props = ["speed", "percentage", "time", "totaltime", "position"]
+        payload = json.dumps({"jsonrpc": "2.0", "method": "Player.GetProperties",
+                              "params": {"playerid": player_id, "properties": props}, "id": "state"})
+        item = json.dumps({"jsonrpc": "2.0", "method": "Player.GetItem",
+                           "params": {"playerid": player_id,
+                                      "properties": ["title", "file", "type", "label"]}, "id": "item"})
+        for key, body in (("player_state", payload), ("current_item", item)):
+            reply = run(["curl", "-fsS", "--max-time", "2", "-H", "Content-Type: application/json",
+                         "--data", body, "http://127.0.0.1:8080/jsonrpc"], 3)
+            try:
+                result["queries"][f"{key}_{player_id}"] = json.loads(reply.get("stdout", ""))
+            except ValueError:
+                result["queries"][f"{key}_{player_id}"] = {"unavailable": True}
+    gui = result["queries"].get("gui", {})
+    gui_text = json.dumps(gui).lower()
+    result["plex_evidence"] = {
+        "detected": any(x in gui_text for x in ("plex", "script.plexmod", "plugin://script.plexmod")),
+        "basis": "currentwindow/currentcontrol JSON-RPC string match",
+    }
+    return result
+
+
+def drm_state() -> list[dict[str, Any]]:
+    connectors: list[dict[str, Any]] = []
+    for raw in sorted(glob.glob("/sys/class/drm/card*-HDMI-A-*")):
+        path = Path(raw)
+        edid = b""
+        try:
+            edid = (path / "edid").read_bytes()
+        except OSError:
+            pass
+        connectors.append({
+            "name": path.name,
+            "status": read_text(path / "status"),
+            "enabled": read_text(path / "enabled"),
+            "modes": (read_text(path / "modes") or "").splitlines(),
+            "current_mode": read_text(path / "mode"),
+            "dpms": read_text(path / "dpms"),
+            "edid_present": bool(edid),
+            "edid_bytes": len(edid),
+            "edid_sha256": hashlib.sha256(edid).hexdigest() if edid else None,
+        })
+    return connectors
+
+
+def display_state(connectors: list[dict[str, Any]]) -> dict[str, Any]:
+    """DRM alone cannot prove on/standby; preserve that uncertainty."""
+    if not connectors:
+        return {"state": "unavailable", "evidence_source": "no_drm_connector"}
+    connected = [x for x in connectors if x["status"] == "connected"]
+    if not connected:
+        return {"state": "unavailable", "evidence_source": "drm_disconnect",
+                "connectors": [x["name"] for x in connectors]}
+    return {
+        "state": "unknown",
+        "evidence_source": "drm_connected_not_power_proof",
+        "connectors": [x["name"] for x in connected],
+    }
+
+
+def input_devices() -> list[dict[str, Any]]:
+    devices: list[dict[str, Any]] = []
+    for dev in sorted(Path("/sys/bus/usb/devices").glob("*")):
+        vid = read_text(dev / "idVendor")
+        pid = read_text(dev / "idProduct")
+        if not vid or not pid:
+            continue
+        manufacturer = read_text(dev / "manufacturer") or ""
+        product = read_text(dev / "product") or ""
+        if not re.search(r"8bitdo|flirc", f"{manufacturer} {product}", re.I):
+            continue
+        serial = read_text(dev / "serial")
+        nodes: list[dict[str, str]] = []
+        for cls in ("event*", "js*"):
+            for link in Path("/sys/class/input").glob(cls):
+                try:
+                    if str(dev.resolve()) in str(link.resolve()):
+                        nodes.append({"node": f"/dev/input/{link.name}", "kind":
+                                      "joystick" if link.name.startswith("js") else "event"})
+                except OSError:
+                    pass
+        state = "idle" if pid.lower() == "301c" or "idle" in product.lower() else (
+            "present_stable" if nodes else "present_unstable"
+        )
+        devices.append({
+            "stable_id": f"usb:{serial or dev.name}:{dev.name}:{vid}:{pid}",
+            "usb_path": dev.name, "serial": serial, "vendor_id": vid,
+            "product_id": pid, "manufacturer": manufacturer, "product": product,
+            "identity": "idle" if state == "idle" else "active",
+            "state": state, "nodes": nodes, "by_id": stable_links(nodes, "by-id"),
+            "by_path": stable_links(nodes, "by-path"),
+        })
+    return devices
+
+
+def stable_links(nodes: list[dict[str, str]], directory: str) -> list[str]:
+    node_names = {Path(x["node"]).name for x in nodes}
+    found: list[str] = []
+    base = Path("/dev/input") / directory
+    try:
+        for link in base.iterdir():
+            try:
+                if link.resolve().name in node_names:
+                    found.append(str(link))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return sorted(found)
+
+
+def kodi_open_input_nodes(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {"available": True, "pids": {}, "nodes": []}
+    for row in rows:
+        if row["comm"] not in ("kodi", "kodi.bin"):
+            continue
+        links: list[str] = []
+        try:
+            for fd in (Path("/proc") / str(row["pid"]) / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                    if target.startswith("/dev/input/"):
+                        links.append(target)
+                except OSError:
+                    pass
+        except (OSError, PermissionError) as exc:
+            result["available"] = False
+            result["error"] = str(exc)
+        result["pids"][str(row["pid"])] = sorted(set(links))
+        result["nodes"].extend(links)
+    result["nodes"] = sorted(set(result["nodes"]))
+    return result
+
+
+def relevant_logs() -> dict[str, Any]:
+    kodi_lines: list[str] = []
+    if KODI_LOG.is_file():
+        try:
+            lines = KODI_LOG.read_text(errors="replace").splitlines()
+            rx = re.compile(r"joystick|peripheral|wayland|display|hdmi|cec|plex|jsonrpc", re.I)
+            kodi_lines = [line for line in lines if rx.search(line)][-int(CFG["KODI_LOG_LINES"]):]
+        except OSError:
+            pass
+    journal = run(["journalctl", "-b", "--no-pager", "-n", str(CFG["JOURNAL_LINES"])], 8)
+    if journal.get("ok"):
+        rx = re.compile(r"drm|vc4|hdmi|cec|wayland|labwc|usb|input|joystick|hotplug", re.I)
+        journal["stdout"] = "\n".join(x for x in journal["stdout"].splitlines() if rx.search(x))
+    return {"kodi": kodi_lines, "journal": journal}
+
+
+def antimicrox_state(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    matches = [x for x in rows if x["comm"].lower() == "antimicrox"]
+    return {
+        "running": bool(matches), "processes": matches,
+        "controller_target": "all" if any("--profile-controller" not in x["cmdline"] for x in matches)
+        else "explicit",
+        "profile": profile(),
+    }
+
+
+def snapshot_data(include_logs: bool = True) -> dict[str, Any]:
+    rows = proc_rows()
+    drm = drm_state()
+    data: dict[str, Any] = {
+        "schema_version": 1, "timestamp": wall_time(), "monotonic_timestamp": mono_time(),
+        "tvboxctl_status": run([str(REPO / "bin/tvboxctl"), "status"], 5),
+        "active_context": context(), "input_profile": profile(),
+        "locks": {
+            "transition": lock_state(STATE_DIR / "lock"),
+            "inputctl": lock_state(STATE_DIR / "inputctl.lock"),
+        },
+        "processes": rows, "wayland": wayland_state(), "kodi_jsonrpc": kodi_rpc(),
+        "drm": drm, "display_state": display_state(drm),
+        "wlr_randr": run(["wlr-randr"], 4, gui_env()),
+        "cec": cec_status(), "input_devices": input_devices(),
+        "kodi_open_input_nodes": kodi_open_input_nodes(rows),
+        "antimicrox": antimicrox_state(rows),
+    }
+    if include_logs:
+        data["recent_logs"] = relevant_logs()
+    return data
+
+
+def cec_devices() -> list[str]:
+    if CFG["CEC_DEVICE"] != "auto":
+        return [str(CFG["CEC_DEVICE"])]
+    return sorted(glob.glob("/dev/cec*"))
+
+
+def cec_status() -> dict[str, Any]:
+    devices = cec_devices()
+    result: dict[str, Any] = {"devices": devices, "available": bool(devices)}
+    if devices:
+        result["topology"] = run(["cec-ctl", "-d", devices[0], "--show-topology"], 8)
+    else:
+        result["reason"] = "no_cec_device"
+    return result
+
+
+def expected_profile(ctx: str) -> set[str] | None:
+    return {
+        "kodi": {"kodi_native_minimal"}, "plex": {"kodi_native_minimal"},
+        "youtube": {"controller_kbm_generic", "youtube_remote"},
+        "spotify": {"spotify_ui", "controller_kbm_generic"},
+        "moonlight": {"passthrough"}, "steamlink": {"passthrough"},
+        "mariokart64": {"mariokart_n64"}, "desktop": {"controller_kbm_generic", "desktop_mouse"},
+    }.get(ctx)
+
+
+def expected_app(ctx: str) -> tuple[str, str] | None:
+    return {
+        "kodi": (r"^kodi(?:\.bin)?$", r"^Kodi$"),
+        "plex": (r"^kodi(?:\.bin)?$", r"^Kodi$"),
+        "youtube": (r"chromium.*chromium-tvbox-youtube", r"chromium|youtube"),
+        "spotify": (r"spotify|chromium.*spotify", r"chromium|spotify"),
+        "moonlight": (r"moonlight", r"moonlight"),
+        "steamlink": (r"steamlink", r"steamlink|shell"),
+        "mariokart64": (r"mupen64", r"mupen64"),
+    }.get(ctx)
+
+
+def anomalies(s: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    ctx, prof = s["active_context"], s["input_profile"]
+    rows = s["processes"]
+    tops = s["wayland"]["toplevels"]
+
+    def add(kind: str, severity: str, details: Any) -> None:
+        out.append(record("anomaly_detector", kind, severity, details, ctx, prof))
+
+    if ctx not in VALID_CONTEXTS:
+        add("active_context_invalid", "warning", {"value": ctx})
+    if prof not in VALID_PROFILES:
+        add("input_profile_invalid", "warning", {"value": prof})
+    expected = expected_profile(ctx)
+    if expected and prof not in expected:
+        add("input_profile_mismatch", "warning", {"expected": sorted(expected), "actual": prof})
+    app = expected_app(ctx)
+    if app:
+        proc_rx, top_rx = app
+        proc_ok = any(re.search(proc_rx, r["comm"], re.I) or re.search(proc_rx, r["cmdline"], re.I) for r in rows)
+        top_ok = any(
+            re.search(top_rx, t["app_id"], re.I) or re.search(top_rx, t["title"], re.I)
+            for t in tops
+        )
+        if not proc_ok:
+            add("context_process_mismatch", "error", {"context": ctx, "expected_process": proc_rx})
+        if s["wayland"]["connected"] and not top_ok:
+            add("kodi_toplevel_missing" if ctx in ("kodi", "plex") else "context_toplevel_mismatch",
+                "error", {"context": ctx, "expected_toplevel": top_rx})
+        unexpected_tops = [
+            t for t in tops
+            if not (re.search(top_rx, t["app_id"], re.I) or re.search(top_rx, t["title"], re.I))
+        ]
+        if top_ok and unexpected_tops and s["wayland"]["focus"]["state"] == "unknown":
+            add("focus_mismatch_suspected", "info", {
+                "reason": "focus_not_observable; additional toplevel presence is only a proxy",
+                "expected": top_rx, "additional_toplevels": unexpected_tops,
+            })
+    kodi_alive = any(r["comm"] in ("kodi", "kodi.bin") for r in rows)
+    kodi_top = any(re.search(r"^Kodi$", t["app_id"], re.I) for t in tops)
+    if kodi_alive and s["wayland"]["connected"] and not kodi_top:
+        add("kodi_toplevel_missing", "error", {"kodi_process_alive": True})
+    lock = s["locks"]["transition"]
+    if lock.get("held") and lock.get("held_observed_seconds", 0) > CFG["LOCK_HELD_THRESHOLD"]:
+        add("transition_lock_long_held", "warning", lock)
+    controllers = [x for x in s["input_devices"] if x["manufacturer"].lower().startswith("8bitdo")]
+    active = [x for x in controllers if x["identity"] == "active"]
+    unstable = [x for x in active if x.get("state") == "present_unstable"]
+    if unstable:
+        add("controller_reconnect_unstable", "info", {
+            "stable_ids": [x["stable_id"] for x in unstable],
+            "settle_interval_seconds": CFG["CONTROLLER_SETTLE_INTERVAL"],
+        })
+    anti = s["antimicrox"]
+    if len(active) > 1 and anti["running"] and anti["controller_target"] == "all":
+        add("antimicrox_target_all_with_multiple_matching_controllers", "warning",
+            {"stable_ids": [x["stable_id"] for x in active]})
+    log_text = "\n".join(s.get("recent_logs", {}).get("kodi", []))
+    stale = re.findall(r'failed to read joystick.*?(/dev/input/js\d+).*?(?:No such device| - 19)', log_text, re.I)
+    if stale:
+        add("kodi_stale_joystick_handle", "error", {"nodes": sorted(set(stale)), "evidence": "kodi_log"})
+    open_errors = re.findall(r"can't open (/dev/input/js\d+).*?(?:errno=13|Permission denied)", log_text, re.I)
+    if open_errors:
+        present_nodes = {n["node"] for c in controllers for n in c["nodes"]}
+        kodi_nodes = set(s["kodi_open_input_nodes"]["nodes"])
+        unsupported = sorted((set(open_errors) & present_nodes) - kodi_nodes)
+        if unsupported:
+            add("kodi_controller_reacquisition_failed", "error", {
+                "nodes": unsupported,
+                "evidence": ["kodi_open_error", "node_present", "node_absent_from_kodi_fds"],
+            })
+    initialized = bool(re.search(r"(?:Initialized joystick|new joystick device registered)", log_text, re.I))
+    present_nodes = {n["node"] for c in controllers for n in c["nodes"]}
+    kodi_nodes = set(s["kodi_open_input_nodes"]["nodes"])
+    acquired = sorted(present_nodes & kodi_nodes)
+    if initialized and acquired:
+        add("kodi_controller_reacquired", "info", {
+            "nodes": acquired, "evidence": ["kodi_initialization_log", "node_open_by_kodi"],
+        })
+    return out
+
+
+def write_snapshot(reason: str = "manual") -> Path:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
+    path = CACHE / f"snapshot-{stamp}-{re.sub('[^a-z0-9_-]', '_', reason.lower())}.json"
+    data = snapshot_data(True)
+    data["reason"] = reason
+    data["anomalies"] = anomalies(data)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    snapshots = sorted(CACHE.glob("snapshot-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in snapshots[int(CFG["SNAPSHOT_RETENTION"]):]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return path
+
+
+def state_digest(s: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "active_context": s["active_context"], "input_profile": s["input_profile"],
+        "processes": [(x["comm"], x["pid"]) for x in s["processes"]],
+        "toplevels": s["wayland"]["toplevels"], "wayland_connected": s["wayland"]["connected"],
+        "drm": s["drm"], "display_state": s["display_state"],
+        "input_devices": s["input_devices"],
+        "kodi_rpc_available": s["kodi_jsonrpc"]["available"],
+        "kodi_input_nodes": s["kodi_open_input_nodes"]["nodes"],
+    }
+
+
+def classify_changes(old: dict[str, Any], new: dict[str, Any]) -> list[tuple[str, str, Any]]:
+    changes: list[tuple[str, str, Any]] = []
+    if old.get("drm") != new.get("drm"):
+        changes.append(("display_state_changed", "warning", {"before": old.get("drm"), "after": new.get("drm")}))
+    if old.get("display_state") != new.get("display_state"):
+        changes.append(("display_model_transition", "warning",
+                        {"before": old.get("display_state"), "after": new.get("display_state")}))
+    if old.get("wayland_connected") != new.get("wayland_connected"):
+        changes.append(("wayland_output_changed", "warning",
+                        {"before": old.get("wayland_connected"), "after": new.get("wayland_connected")}))
+    if old.get("toplevels") != new.get("toplevels"):
+        changes.append(("toplevel_set_changed", "info",
+                        {"before": old.get("toplevels"), "after": new.get("toplevels")}))
+    old_devs = {x["stable_id"]: x for x in old.get("input_devices", [])}
+    new_devs = {x["stable_id"]: x for x in new.get("input_devices", [])}
+    for stable in old_devs.keys() - new_devs.keys():
+        changes.append(("controller_usb_removed", "warning", old_devs[stable]))
+    for stable in new_devs.keys() - old_devs.keys():
+        kind = "controller_usb_added"
+        changes.append((kind, "info", new_devs[stable]))
+    controller_changed = old_devs != new_devs
+    # Process tuples are (comm, pid); correlate a remapper PID change with device churn.
+    old_anti = [pid for comm, pid in old.get("processes", []) if comm.lower() == "antimicrox"]
+    new_anti = [pid for comm, pid in new.get("processes", []) if comm.lower() == "antimicrox"]
+    if controller_changed and old_anti != new_anti:
+        changes.append(("antimicrox_restart_during_controller_reconnect", "warning",
+                        {"before_pids": old_anti, "after_pids": new_anti}))
+    by_path_old = {x["usb_path"]: x for x in old_devs.values() if x["manufacturer"].lower().startswith("8bitdo")}
+    by_path_new = {x["usb_path"]: x for x in new_devs.values() if x["manufacturer"].lower().startswith("8bitdo")}
+    for usb_path in by_path_old.keys() & by_path_new.keys():
+        before, after = by_path_old[usb_path], by_path_new[usb_path]
+        if before["identity"] != after["identity"]:
+            kind = "controller_entered_idle" if after["identity"] == "idle" else "controller_left_idle"
+            changes.append((kind, "warning", {"before": before, "after": after}))
+        old_nodes = {x["node"]: x["kind"] for x in before["nodes"]}
+        new_nodes = {x["node"]: x["kind"] for x in after["nodes"]}
+        for node in old_nodes.keys() - new_nodes.keys():
+            kind = "controller_joystick_node_removed" if old_nodes[node] == "joystick" else "controller_event_node_removed"
+            changes.append((kind, "warning", {"stable_id": after["stable_id"], "node": node}))
+        for node in new_nodes.keys() - old_nodes.keys():
+            kind = "controller_joystick_node_added" if new_nodes[node] == "joystick" else "controller_event_node_added"
+            changes.append((kind, "info", {"stable_id": after["stable_id"], "node": node}))
+    return changes
+
+
+def udev_process() -> subprocess.Popen[str] | None:
+    if not shutil.which("udevadm"):
+        return None
+    try:
+        proc = subprocess.Popen(
+            ["udevadm", "monitor", "--udev", "--property"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        os.set_blocking(proc.stdout.fileno(), False)
+        return proc
+    except OSError:
+        return None
+
+
+def watch(diagnostic: bool) -> int:
+    interval = CFG["DIAGNOSTIC_POLL_INTERVAL"] if diagnostic else CFG["POLL_INTERVAL"]
+    emit("healthd", "observer_started", "info", {"poll_interval": interval, "observation_only": True})
+    previous: dict[str, Any] | None = None
+    previous_anomalies: set[str] = set()
+    last_heartbeat = 0.0
+    last_snapshot = 0.0
+    stable_since: dict[str, float] = {}
+    lock_held_since: float | None = None
+    udev = udev_process()
+    if udev is None:
+        emit("udev", "monitor_unavailable", "warning", {})
+    while True:
+        started = time.monotonic()
+        snap = snapshot_data(False)
+        if snap["locks"]["transition"].get("held"):
+            if lock_held_since is None:
+                lock_held_since = time.monotonic()
+            snap["locks"]["transition"]["held_observed_seconds"] = round(
+                time.monotonic() - lock_held_since, 3
+            )
+        else:
+            lock_held_since = None
+        now_ids = {x["stable_id"] for x in snap["input_devices"] if x["identity"] == "active"}
+        for stable_id in list(stable_since):
+            if stable_id not in now_ids:
+                stable_since.pop(stable_id, None)
+        for dev in snap["input_devices"]:
+            if dev["identity"] != "active":
+                continue
+            first = stable_since.setdefault(dev["stable_id"], time.monotonic())
+            age = time.monotonic() - first
+            dev["state"] = ("present_stable" if age >= CFG["CONTROLLER_SETTLE_INTERVAL"]
+                            else "present_unstable")
+            dev["settling_seconds"] = round(age, 3)
+        digest = state_digest(snap)
+        if previous is None:
+            emit("healthd", "baseline", "info", digest)
+        else:
+            for kind, severity, details in classify_changes(previous, digest):
+                emit("healthd", kind, severity, details)
+        current = anomalies(snap)
+        current_types = {x["event_type"] for x in current}
+        for item in current:
+            if item["event_type"] not in previous_anomalies:
+                print(json.dumps(item, sort_keys=True), flush=True)
+                if item["severity"] in ("warning", "error") and time.monotonic() - last_snapshot >= CFG["SNAPSHOT_RATE_LIMIT"]:
+                    path = write_snapshot(item["event_type"])
+                    emit("snapshot", "anomaly_snapshot_created", "info", {"path": str(path)})
+                    last_snapshot = time.monotonic()
+        for resolved in previous_anomalies - current_types:
+            emit("anomaly_detector", "anomaly_resolved", "info", {"event_type": resolved})
+        previous_anomalies = current_types
+        previous = digest
+        now = time.monotonic()
+        if now - last_heartbeat >= CFG["HEARTBEAT_INTERVAL"]:
+            emit("healthd", "heartbeat", "info", {"pid": os.getpid()})
+            last_heartbeat = now
+        if udev is not None and udev.poll() is not None:
+            emit("udev", "monitor_exited", "warning", {"returncode": udev.returncode})
+            udev = None
+        if udev is not None and udev.stdout is not None:
+            try:
+                ready, _, _ = select.select([udev.stdout], [], [], 0)
+                if ready:
+                    lines: list[str] = []
+                    while True:
+                        line = udev.stdout.readline()
+                        if not line:
+                            break
+                        lines.append(line.rstrip())
+                    raw = "\n".join(lines)[-16384:]
+                    if re.search(r"SUBSYSTEM=(?:drm|usb|input)|/drm/|/input/|/usb", raw, re.I):
+                        emit("udev", "device_lifecycle_event", "info", {"raw": raw})
+                        if re.search(r"SUBSYSTEM=drm|/drm/", raw, re.I):
+                            emit("drm", "drm_udev_event", "warning",
+                                 {"raw": raw, "post_event_state": drm_state()})
+                            if time.monotonic() - last_snapshot >= CFG["SNAPSHOT_RATE_LIMIT"]:
+                                path = write_snapshot("drm_udev_event")
+                                emit("snapshot", "drm_event_snapshot_created", "info", {"path": str(path)})
+                                last_snapshot = time.monotonic()
+            except (OSError, ValueError) as exc:
+                emit("udev", "monitor_read_failed", "warning", {"error": str(exc)})
+                udev = None
+        sleep_for = max(0.1, interval - (time.monotonic() - started))
+        time.sleep(sleep_for)
+
+
+CEC_PATTERNS = {
+    "standby": re.compile(r"\bstandby\b", re.I),
+    "report_power_status": re.compile(r"report power status|report-power-status", re.I),
+    "active_source": re.compile(r"active source|active-source", re.I),
+    "routing": re.compile(r"routing (?:change|information)|set stream path", re.I),
+}
+
+
+def cec_watch() -> int:
+    devices = cec_devices()
+    if not devices:
+        emit("cec", "cec_adapter_unavailable", "error", {"reason": "no /dev/cec*"})
+        return 1
+    device = devices[0]
+    emit("cec", "cec_monitor_started", "info", {"device": device, "mode": "passive"})
+    argv = ["cec-ctl", "-d", device, "--monitor", "--show-raw", "--wall-clock"]
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace", bufsize=1)
+    except (OSError, PermissionError) as exc:
+        emit("cec", "cec_monitor_failed", "error", {"device": device, "error": str(exc)})
+        return 1
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        raw = line.rstrip()
+        emit("cec", "cec_raw", "info", {"device": device, "line": raw})
+        for kind, rx in CEC_PATTERNS.items():
+            if rx.search(raw):
+                emit("cec", f"cec_{kind}", "info", {"device": device, "line": raw,
+                                                    "evidence_source": "cec_broadcast"})
+    rc = proc.wait()
+    emit("cec", "cec_monitor_exited", "warning", {"device": device, "returncode": rc})
+    return rc or 1
+
+
+def bundle() -> Path:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
+    archive = CACHE / f"tvbox-diagnostics-{stamp}.tar.gz"
+    with tempfile.TemporaryDirectory(prefix="tvbox-diag-", dir="/tmp") as tmp:
+        root = Path(tmp) / f"tvbox-diagnostics-{stamp}"
+        root.mkdir()
+        current = write_snapshot("bundle")
+        shutil.copy2(current, root / "current-snapshot.json")
+        for source in [
+            REPO / "docs/tvbox-focus-cec-diagnostic-discovery.md",
+            REPO / "docs/tvbox-focus-cec-diagnostic-tests.md",
+            REPO / "docs/tvbox-future-recovery-design.md",
+            REPO / "config/tvbox-diag.conf.example",
+            HOME / ".config/tvbox/tvbox-diag.conf",
+        ]:
+            if source.is_file():
+                shutil.copy2(source, root / source.name)
+        snaps = root / "anomaly-snapshots"
+        snaps.mkdir()
+        for source in sorted(CACHE.glob("snapshot-*.json"))[-int(CFG["SNAPSHOT_RETENTION"]):]:
+            shutil.copy2(source, snaps / source.name)
+        for unit in ("tvbox-healthd.service", "tvbox-healthd-cec.service"):
+            status = run(["systemctl", "--user", "--no-pager", "--full", "status", unit], 5)
+            (root / f"{unit}.status.txt").write_text(
+                (status.get("stdout", "") + "\n" + status.get("stderr", "")).strip() + "\n"
+            )
+        journal = run(["journalctl", "--user", "--no-pager", "-u", "tvbox-healthd.service",
+                       "-u", "tvbox-healthd-cec.service", "-n", "2000"], 10)
+        (root / "observer-journal.txt").write_text(journal.get("stdout", "") + "\n")
+        (root / "CONTENTS.txt").write_text(
+            "Allowlisted discovery/test/design docs, current and bounded anomaly snapshots, "
+            "two service statuses, and at most 2000 observer journal lines.\n"
+            "Excluded: browser/Kodi/Spotify profiles, tokens, credentials, SSH/API keys, "
+            "personal files, and arbitrary keyboard text.\n"
+        )
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(root, arcname=root.name)
+    return archive
+
+
+def status_command() -> int:
+    data = {
+        "schema_version": 1, "timestamp": wall_time(), "monotonic_timestamp": mono_time(),
+        "active_context": context(), "input_profile": profile(),
+        "config_files": [str(x) for x in CONFIGS if x.is_file()],
+        "cache": str(CACHE), "services_enabled_by_installer": False,
+        "capabilities": {
+            "wayland": wayland_state(), "cec": cec_status(),
+            "drm_connectors": [x["name"] for x in drm_state()],
+            "input_devices": input_devices(),
+        },
+    }
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0
+
+
+def test_command(name: str) -> int:
+    snap = snapshot_data(False)
+    if name == "focus":
+        result = {
+            "test": "focus", "passive": True, "focus": snap["wayland"]["focus"],
+            "toplevels": snap["wayland"]["toplevels"],
+            "conclusion": "confirmed mismatch is possible only when activation is exposed",
+        }
+    else:
+        result = {
+            "test": "cec", "passive": True, "status": snap["cec"],
+            "conclusion": "no CEC control/power/source command was transmitted",
+        }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if (name == "focus" and snap["wayland"]["connected"]) or (
+        name == "cec" and snap["cec"]["available"]) else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="tvbox-diag", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status")
+    sub.add_parser("snapshot")
+    watch_parser = sub.add_parser("watch")
+    watch_parser.add_argument("--diagnostic", action="store_true", help="use the 1-2 second test interval")
+    sub.add_parser("cec-watch")
+    test_parser = sub.add_parser("test")
+    test_parser.add_argument("component", choices=("focus", "cec"))
+    sub.add_parser("bundle")
+    args = parser.parse_args()
+    if args.command == "status":
+        return status_command()
+    if args.command == "snapshot":
+        path = write_snapshot()
+        print(path)
+        return 0
+    if args.command == "watch":
+        try:
+            return watch(args.diagnostic)
+        except KeyboardInterrupt:
+            emit("healthd", "observer_stopped", "info", {"reason": "interrupt"})
+            return 0
+    if args.command == "cec-watch":
+        try:
+            return cec_watch()
+        except KeyboardInterrupt:
+            emit("cec", "cec_monitor_stopped", "info", {"reason": "interrupt"})
+            return 0
+    if args.command == "test":
+        return test_command(args.component)
+    if args.command == "bundle":
+        path = bundle()
+        print(f"{path}\nContains bounded observer logs, status, discovery/config, and snapshots.")
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
