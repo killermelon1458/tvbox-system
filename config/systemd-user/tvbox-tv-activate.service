@@ -1,0 +1,11 @@
+[Unit]
+Description=Activate TVBox HDMI source
+After=default.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/tvbox
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/local/bin/tvbox-tv activate
+TimeoutStartSec=55
+SyslogIdentifier=tvbox-tv-activate

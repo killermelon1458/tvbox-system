@@ -1,12 +1,19 @@
 #!/bin/bash
 
+request_tv_activation() {
+  timeout 1 systemctl --user start --no-block tvbox-tv-activate.service \
+    >/dev/null 2>&1 || true
+}
+
 # Emergency Mario Kart / Mupen64Plus exit.
 # Keep this before tvboxctl so F12/Home can close the emulator.
 if pgrep -x mupen64plus >/dev/null 2>&1; then
   pkill -TERM -x mupen64plus 2>/dev/null || true
+  request_tv_activation
   sleep 1
   /usr/local/bin/tvbox-kodi
   exit 0
 fi
 
+request_tv_activation
 exec /usr/local/bin/tvboxctl home "$@"
