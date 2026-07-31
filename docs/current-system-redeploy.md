@@ -42,13 +42,16 @@ The installer:
 6. Installs systemd drop-ins for raspotify and logind.
 7. Copies TVBox Kodi addons into /home/tvbox/.kodi/addons.
 8. Copies repo-owned Kodi keymaps into /home/tvbox/.kodi/userdata/keymaps.
+9. Installs and verifies the narrow GTK/GdkPixbuf screensaver runtime packages.
 ```
 
 Existing `/usr/local/bin/tvbox-*` files are backed up before they are replaced with symlinks.
 
 ## Required Manual Setup
 
-The repo does not currently install OS packages. A new Pi still needs the runtime stack installed first:
+The installer reproducibly installs the screensaver-specific GTK 3,
+GtkLayerShell, GdkPixbuf tools, and HEIF/AVIF loader packages. A new Pi still
+needs the broader appliance runtime stack installed first:
 
 ```text
 labwc desktop session
@@ -308,6 +311,73 @@ Spotify connect starts the visible Spotify mode and Home returns to Kodi.
 Closing Kodi from the Kodi GUI updates `tvboxctl status` to `active-context: desktop` and applies the generic controller keyboard/mouse input profile.
 ```
 
+## Manual Screensaver and Overlay Services
+
+The installer deploys and enables these user services:
+
+```text
+tvbox-overlay.service
+tvbox-screensaver-policy.service
+```
+
+It also installs `~/.config/tvbox/screensaver.toml` when absent and validates
+Python GI bindings for GTK 3 and GtkLayerShell. Runtime sockets and atomic
+observation files live under `%t/tvbox`; no UID is hard-coded.
+
+Manual operation:
+
+```bash
+tvbox-screensaver start
+tvbox-screensaver stop
+tvbox-screensaver status
+tvbox-screensaver mode black
+tvbox-screensaver mode slideshow
+tvbox-screensaver mode scheduled
+tvbox-screensaver formats
+```
+
+The default schedule selects black from 00:00 through 08:00
+`America/Chicago`, otherwise slideshow. The slideshow source defaults to
+`~/Pictures/Screensaver`; absent or invalid content remains opaque black and
+reports degraded status. Mode changes replace the renderer only after the new
+opaque first frame. Home/F12 and application transitions invalidate the exact
+screensaver request before existing lifecycle recovery.
+
+The renderer supports JPEG, PNG, WebP, HEIC/HEIF, and AVIF. GIF (first frame
+only), TIFF, and BMP are also accepted through installed GdkPixbuf loaders.
+Live Photo `.mov`, all video, SVG, DNG/RAW, and animation playback are ignored.
+`tvbox-screensaver formats` reports the registered decoder for each format.
+
+Images use embedded orientation, preserve aspect ratio, and default to
+centered `contain` fit. Black and the image are drawn in one Cairo frame;
+input alpha is flattened over black. Both overlay windows own a GDK blank
+cursor which disappears automatically with the surface.
+
+The recursive scan excludes hidden entries, `.stfolder`, `.stversions`,
+Syncthing temporary names, non-regular files, video, and unsupported media.
+Every decode is isolated on one background worker. Size/mtime/inode changes
+before or during decode reject that attempt, unchanged failures are
+deduplicated, and rescans retry changed files and discover completed additions.
+
+Rollback:
+
+```bash
+systemctl --user disable --now tvbox-screensaver-policy.service
+systemctl --user disable --now tvbox-overlay.service
+unlink ~/.config/systemd/user/tvbox-screensaver-policy.service
+unlink ~/.config/systemd/user/tvbox-overlay.service
+unlink /usr/local/bin/tvbox-screensaver
+unlink /usr/local/bin/tvbox-screensaverd
+unlink /usr/local/bin/tvbox-overlay
+unlink /usr/local/bin/tvbox-render-black
+unlink /usr/local/bin/tvbox-render-slideshow
+systemctl --user daemon-reload
+```
+
+Restore a timestamped `~/.config/tvbox/screensaver.toml.bak.*` only when
+rolling back an intentional configuration replacement. Do not kill renderers
+by executable name; stopping the manager unit removes its control group.
+
 ## Known Gaps
 
 The future plan docs are not implemented yet. In particular:
@@ -317,5 +387,5 @@ tvboxctl menu is a placeholder.
 Most tvboxctl launch subcommands are placeholders except steamlink and mariokart64.
 Only kodi_native_minimal and controller_kbm_generic are currently used as active AntiMicroX remapping profiles.
 Controller-specific profile organization is not implemented yet.
-The installer does not install OS packages or configure external accounts.
+The installer does not install the broader appliance packages or configure external accounts.
 ```

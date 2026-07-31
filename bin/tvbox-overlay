@@ -1,0 +1,24 @@
+#!/usr/bin/python3
+"""Run the TVBox overlay manager."""
+
+import os
+from pathlib import Path
+import signal
+import sys
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from tvbox.overlay.manager import OverlayManager, OverlayServer
+
+
+def main():
+    manager = OverlayManager()
+    server = OverlayServer(manager)
+    signal.signal(signal.SIGTERM, lambda *_: server.stop())
+    signal.signal(signal.SIGINT, lambda *_: server.stop())
+    server.serve()
+
+
+if __name__ == "__main__":
+    main()

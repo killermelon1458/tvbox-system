@@ -16,6 +16,48 @@ if ! id "$TVBOX_USER" >/dev/null 2>&1; then
   exit 1
 fi
 
+screensaver_packages=(
+  gir1.2-gtk-3.0
+  gir1.2-gtklayershell-0.1
+  libgdk-pixbuf2.0-bin
+  heif-gdk-pixbuf
+)
+missing_packages=()
+for package in "${screensaver_packages[@]}"; do
+  if ! dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null | grep -qx installed; then
+    missing_packages+=("$package")
+  fi
+done
+if [ "${#missing_packages[@]}" -gt 0 ]; then
+  echo "Installing screensaver runtime packages: ${missing_packages[*]}"
+  apt-get update
+  apt-get install -y --no-install-recommends "${missing_packages[@]}"
+fi
+
+if ! python3 -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("GtkLayerShell", "0.1"); from gi.repository import Gtk, GtkLayerShell' >/dev/null 2>&1; then
+  echo "ERROR: screensaver renderers require GTK 3 GI and gir1.2-gtklayershell-0.1." >&2
+  exit 1
+fi
+
+if ! python3 - <<'PY'
+import gi
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf
+available = {
+    extension.lower()
+    for image_format in GdkPixbuf.Pixbuf.get_formats()
+    for extension in image_format.get_extensions()
+}
+required = {"jpg", "jpeg", "png", "webp", "heic", "heif", "avif"}
+missing = sorted(required - available)
+if missing:
+    raise SystemExit("missing GdkPixbuf decoders: " + ", ".join(missing))
+PY
+then
+  echo "ERROR: one or more required screensaver image decoders are unavailable." >&2
+  exit 1
+fi
+
 backup_path() {
   local path="$1"
   if [ -e "$path" ] || [ -L "$path" ]; then
@@ -76,6 +118,17 @@ if [ ! -f "$TVBOX_HOME/.config/tvbox/tvbox-diag.conf" ]; then
   echo "Installed user tvbox-diag config from example."
 else
   echo "Keeping existing user tvbox-diag config."
+fi
+
+echo
+echo "Installing screensaver configuration..."
+screensaver_config="$TVBOX_HOME/.config/tvbox/screensaver.toml"
+if [ ! -f "$screensaver_config" ]; then
+  install_file "$REPO_DIR/config/screensaver.toml" \
+    "$screensaver_config" 0644 "$TVBOX_USER:$TVBOX_USER"
+  echo "Installed user screensaver configuration."
+else
+  echo "Keeping existing user screensaver configuration."
 fi
 
 echo

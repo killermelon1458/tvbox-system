@@ -1,0 +1,235 @@
+#!/usr/bin/python3
+"""Opaque, asynchronously decoded picture slideshow renderer."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from pathlib import Path
+import signal
+import sys
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from tvbox.overlay.renderer import (
+    configure_layer_surface, configure_opaque_overlay_window,
+    report_after_first_paint,
+)
+from tvbox.screensaver.slideshow import (
+    FailureReporter, fitted_size, load_oriented_pixbuf, order_images,
+    scan_images,
+)
+
+
+def bool_value(value):
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+class Slideshow:
+    def __init__(self, args, Gtk, Gdk, GdkPixbuf, GLib):
+        self.args = args
+        self.Gtk, self.Gdk, self.GdkPixbuf, self.GLib = Gtk, Gdk, GdkPixbuf, GLib
+        self.window = Gtk.Window()
+        configure_opaque_overlay_window(self.window)
+        self.window.connect("draw", self._draw_black)
+        configure_layer_surface(
+            self.window, "tvbox-overlay-slideshow", args.output)
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="tvbox-render-slideshow: %(levelname)s %(message)s")
+        self.reporter = FailureReporter()
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tvbox-image-decode")
+        self.stopping = False
+        self.candidates = []
+        self.current_candidate = None
+        self.current = None
+        self.scaled = None
+        self.next_decoded = None
+        self.pending = None
+        self.cursor = 0
+        self.failed = set()
+        self._rescan()
+        degradation = None if self.candidates else "no-valid-images-black-fallback"
+        report_after_first_paint(self.window, degradation)
+        self.window.connect("size-allocate", self._resize)
+        self.GLib.timeout_add_seconds(args.rescan_interval, self._rescan)
+        self.GLib.timeout_add(
+            max(1000, int(args.image_duration * 1000)), self._advance)
+        self._ensure_decode("current")
+
+    def _draw_black(self, _widget, context):
+        context.set_source_rgba(0.0, 0.0, 0.0, 1.0)
+        context.set_operator(1)  # cairo.OPERATOR_SOURCE
+        context.paint()
+        if self.scaled is not None:
+            allocation = self.window.get_allocation()
+            x = (allocation.width - self.scaled.get_width()) / 2
+            y = (allocation.height - self.scaled.get_height()) / 2
+            context.set_operator(2)  # cairo.OPERATOR_OVER
+            self.Gdk.cairo_set_source_pixbuf(context, self.scaled, x, y)
+            context.paint()
+        return True
+
+    def _scan(self):
+        return order_images(scan_images(
+            self.args.image_directory, bool_value(self.args.recursive),
+            self.args.extensions.split(","), self.args.max_files,
+            self.args.max_file_bytes,
+        ), bool_value(self.args.shuffle))
+
+    def _rescan(self):
+        candidates = self._scan()
+        # Retry unchanged bad files only on a later bounded scan, not in a
+        # tight decode loop. FailureReporter still suppresses duplicate logs.
+        self.failed.clear()
+        live = {candidate.path: candidate.fingerprint for candidate in candidates}
+        self.candidates = candidates
+        if self.current_candidate and (
+                live.get(self.current_candidate.path)
+                != self.current_candidate.fingerprint):
+            self.current_candidate = None
+            self.current = None
+            self.scaled = None
+            self.window.queue_draw()  # The Cairo-painted black base remains.
+        if self.next_decoded and (
+                live.get(self.next_decoded[0].path)
+                != self.next_decoded[0].fingerprint):
+            self.next_decoded = None
+        if not self.current:
+            self._ensure_decode("current")
+        elif not self.next_decoded:
+            self._ensure_decode("next")
+        return True
+
+    def _candidate_after_current(self):
+        if not self.candidates:
+            return None
+        if self.current_candidate:
+            for index, candidate in enumerate(self.candidates):
+                if candidate.path == self.current_candidate.path:
+                    self.cursor = (index + 1) % len(self.candidates)
+                    break
+        for _ in range(len(self.candidates)):
+            candidate = self.candidates[self.cursor % len(self.candidates)]
+            self.cursor = (self.cursor + 1) % len(self.candidates)
+            if (str(candidate.path), candidate.fingerprint) not in self.failed:
+                return candidate
+        return None
+
+    def _ensure_decode(self, purpose):
+        if self.stopping or self.pending or not self.candidates:
+            return
+        candidate = self._candidate_after_current()
+        if candidate is None:
+            return
+        future = self.executor.submit(
+            load_oriented_pixbuf, candidate, self.args.max_decode_dimension)
+        self.pending = (candidate, purpose, future)
+
+        def completed(done):
+            try:
+                pixbuf, error = done.result(), None
+            except Exception as exc:  # Per-file isolation crosses worker boundary.
+                pixbuf, error = None, str(exc)
+            self.GLib.idle_add(
+                self._decoded, candidate, purpose, pixbuf, error)
+
+        future.add_done_callback(completed)
+
+    def _decoded(self, candidate, purpose, pixbuf, error):
+        if self.stopping:
+            return False
+        if self.pending and self.pending[0] == candidate:
+            self.pending = None
+        current = next((item for item in self.candidates
+                        if item.path == candidate.path), None)
+        if error or current is None or current.fingerprint != candidate.fingerprint:
+            self.reporter.failure(candidate, error or "file-changed-after-decode")
+            self.failed.add((str(candidate.path), candidate.fingerprint))
+            self._ensure_decode(purpose)
+            return False
+        self.reporter.success(candidate.path)
+        if purpose == "current" or self.current is None:
+            self.current_candidate, self.current = candidate, pixbuf
+            self.scaled = self._scaled(pixbuf)
+            self.window.queue_draw()
+            self._ensure_decode("next")
+        else:
+            self.next_decoded = (candidate, pixbuf)
+        return False
+
+    def _scaled(self, pixbuf):
+        allocation = self.window.get_allocation()
+        width, height = fitted_size(
+            pixbuf.get_width(), pixbuf.get_height(),
+            allocation.width, allocation.height, self.args.fit_mode,
+        )
+        return pixbuf.scale_simple(
+            width, height, self.GdkPixbuf.InterpType.BILINEAR)
+
+    def _resize(self, *_):
+        if self.current is not None:
+            self.scaled = self._scaled(self.current)
+            self.window.queue_draw()
+
+    def _advance(self):
+        if self.next_decoded:
+            self.current_candidate, self.current = self.next_decoded
+            self.next_decoded = None
+            self.scaled = self._scaled(self.current)
+            self.window.queue_draw()
+            self._ensure_decode("next")
+        elif not self.current:
+            self._ensure_decode("current")
+        else:
+            self._ensure_decode("next")
+        return not self.stopping
+
+    def run(self):
+        def stop(signum, _frame):
+            print(f"tvbox-render-slideshow: signal={signum}",
+                  file=sys.stderr, flush=True)
+            self.stopping = True
+            self.Gtk.main_quit()
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        self.window.show_all()
+        self._resize()
+        print("tvbox-render-slideshow: entering main loop",
+              file=sys.stderr, flush=True)
+        self.Gtk.main()
+        self.stopping = True
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        print("tvbox-render-slideshow: main loop exited",
+              file=sys.stderr, flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", default="0")
+    parser.add_argument("--image-directory", required=True)
+    parser.add_argument("--recursive", default="true")
+    parser.add_argument("--image-duration", type=float, default=30.0)
+    parser.add_argument("--fit-mode", choices=["contain", "cover"], default="contain")
+    parser.add_argument("--shuffle", default="true")
+    parser.add_argument(
+        "--extensions",
+        default="jpg,jpeg,png,webp,heic,heif,avif,gif,tif,tiff,bmp")
+    parser.add_argument("--max-files", type=int, default=5000)
+    parser.add_argument("--max-file-bytes", type=int, default=268435456)
+    parser.add_argument("--max-decode-dimension", type=int, default=8192)
+    parser.add_argument("--rescan-interval", type=int, default=30)
+    args = parser.parse_args()
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
+    Slideshow(args, Gtk, Gdk, GdkPixbuf, GLib).run()
+
+
+if __name__ == "__main__":
+    main()

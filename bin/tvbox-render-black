@@ -1,0 +1,51 @@
+#!/usr/bin/python3
+"""Opaque black GtkLayerShell renderer."""
+
+import argparse
+from pathlib import Path
+import signal
+import sys
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from tvbox.overlay.renderer import (
+    configure_layer_surface, configure_opaque_overlay_window,
+    report_after_first_paint,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", default="0")
+    args = parser.parse_args()
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, Gtk
+    window = Gtk.Window()
+    configure_opaque_overlay_window(window)
+
+    def draw_black(_widget, context):
+        context.set_source_rgba(0.0, 0.0, 0.0, 1.0)
+        context.set_operator(1)  # cairo.OPERATOR_SOURCE
+        context.paint()
+        return True
+
+    window.connect("draw", draw_black)
+    configure_layer_surface(window, "tvbox-overlay-black", args.output)
+    report_after_first_paint(window)
+    def stop(signum, _frame):
+        print(f"tvbox-render-black: signal={signum}", file=sys.stderr, flush=True)
+        Gtk.main_quit()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    window.show_all()
+    print("tvbox-render-black: entering main loop", file=sys.stderr, flush=True)
+    Gtk.main()
+    print("tvbox-render-black: main loop exited", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()

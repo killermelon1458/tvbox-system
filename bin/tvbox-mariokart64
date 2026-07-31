@@ -26,6 +26,7 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 /usr/local/bin/tvbox-stop-spotify 2>/tmp/tvbox-stop-spotify.log || true
+/usr/local/bin/tvbox-screensaver stop >/dev/null 2>&1 || true
 /usr/local/bin/tvbox-state ensure-request mariokart64 >/dev/null 2>&1 || true
 /usr/local/bin/tvbox-state phase client-starting --application mariokart64 >/dev/null 2>&1 || true
 

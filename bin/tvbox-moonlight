@@ -77,6 +77,7 @@ trap cleanup_return_to_kodi EXIT
 log "==== tvbox-moonlight target=$TARGET ===="
 log "HOST=$HOST DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
 
+/usr/local/bin/tvbox-screensaver stop >/dev/null 2>&1 || true
 /usr/local/bin/tvbox-inputctl set-profile passthrough >> "$LOG" 2>&1 || true
 /usr/local/bin/tvbox-state ensure-request moonlight "$TARGET" >/dev/null 2>&1 || true
 /usr/local/bin/tvbox-state phase client-starting --application moonlight >/dev/null 2>&1 || true

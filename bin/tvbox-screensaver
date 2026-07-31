@@ -1,0 +1,78 @@
+#!/usr/bin/python3
+"""Manual TVBox screensaver client."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+
+def runtime_root():
+    override = os.environ.get("TVBOX_RUNTIME_ROOT")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if not xdg:
+        raise RuntimeError("XDG_RUNTIME_DIR is required")
+    return Path(xdg) / "tvbox"
+
+
+def request(message):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(15)
+    client.connect(str(runtime_root() / "screensaver.sock"))
+    client.sendall(json.dumps(message).encode() + b"\n")
+    data = b""
+    while b"\n" not in data:
+        chunk = client.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    client.close()
+    return json.loads(data.split(b"\n", 1)[0])
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("start")
+    sub.add_parser("stop")
+    sub.add_parser("status")
+    sub.add_parser("reload")
+    sub.add_parser("formats")
+    mode = sub.add_parser("mode")
+    mode.add_argument("mode", choices=["black", "slideshow", "scheduled"])
+    invalidate = sub.add_parser("invalidate")
+    invalidate.add_argument("--request-id")
+    args = parser.parse_args()
+    if args.command == "formats":
+        from tvbox.screensaver.slideshow import decoder_support
+        support = decoder_support()
+        print(json.dumps(support, indent=2, sort_keys=True))
+        return 0 if all(item["available"] for item in support.values()
+                        if item["required"]) else 1
+    message = {"command": args.command}
+    if args.command == "mode":
+        message["mode"] = args.mode
+    if args.command == "invalidate":
+        message["request_id"] = args.request_id
+    try:
+        response = request(message)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"tvbox-screensaver: {exc}", file=sys.stderr)
+        return 1
+    if not response.get("ok"):
+        print(f"tvbox-screensaver: {response.get('error', 'request failed')}",
+              file=sys.stderr)
+        return 1
+    print(json.dumps(response.get("status"), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

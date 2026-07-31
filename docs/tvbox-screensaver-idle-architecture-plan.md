@@ -1,5 +1,13 @@
 # TVBox Screensaver and Idle Architecture Plan
 
+> **Status: superseded for overlay/screensaver implementation.**
+>
+> This historical plan is retained for its broader idle-policy goals. The
+> discovery-backed replacement is
+> `docs/tvbox-screensaver-overlay-scheduling-implementation-plan.md`. Do not use
+> this document as the implementation contract for the overlay manager,
+> renderers, manual screensaver, or scheduling.
+
 ## 1. Purpose
 
 This document defines the planned architecture for TVBox idle detection, screensaver policy, overlay rendering, and application-specific idle providers.

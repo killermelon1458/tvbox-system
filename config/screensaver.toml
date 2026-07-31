@@ -1,0 +1,21 @@
+[screensaver]
+default_mode = "slideshow"
+timezone = "America/Chicago"
+output = "0"
+
+[[screensaver.schedule]]
+start = "00:00"
+end = "08:00"
+mode = "black"
+
+[slideshow]
+image_directory = "/home/tvbox/Pictures/Screensaver"
+recursive = true
+image_duration = 30.0
+fit_mode = "contain"
+shuffle = true
+supported_image_types = ["jpg", "jpeg", "png", "webp", "heic", "heif", "avif", "gif", "tif", "tiff", "bmp"]
+max_files = 5000
+max_file_bytes = 268435456
+max_decode_dimension = 8192
+rescan_interval = 30

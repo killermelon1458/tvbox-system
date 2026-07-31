@@ -1,6 +1,8 @@
 #!/bin/bash
 set -u
 
+/usr/local/bin/tvbox-screensaver stop >/dev/null 2>&1 || true
+
 export HOME=/home/tvbox
 export USER=tvbox
 export LOGNAME=tvbox

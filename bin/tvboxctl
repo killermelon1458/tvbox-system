@@ -27,6 +27,7 @@ STEAMLINK_BIN="/usr/bin/steamlink"
 MARIOKART64_WRAPPER="/usr/local/bin/tvbox-mariokart64"
 INPUTCTL="/usr/local/bin/tvbox-inputctl"
 STATECTL="/usr/local/bin/tvbox-state"
+SCREENSAVER="/usr/local/bin/tvbox-screensaver"
 
 MAX_PRESERVED_APPS=0
 EXIT_CLOSES_KODI=0
@@ -72,6 +73,12 @@ log() {
 
 log_recovery() {
   printf '%s %s\n' "$(date -Is 2>/dev/null || date)" "$*" >> "$RECOVERY_LOG_FILE"
+}
+
+invalidate_screensaver() {
+  if [ -x "$SCREENSAVER" ]; then
+    "$SCREENSAVER" stop >/dev/null 2>&1 || true
+  fi
 }
 
 button_state_file() {
@@ -687,6 +694,7 @@ do_home() {
 
   log "home requested; context=$(get_context); count=$press_count"
   log_recovery "button=home count=$press_count context=$(get_context) action=home"
+  invalidate_screensaver
 
   if [ "$press_count" -ge "$PANIC_PRESS_THRESHOLD" ] 2>/dev/null; then
     recover_panic_local "home" "$press_count"
@@ -775,6 +783,7 @@ do_exit() {
 
   log "exit requested; context=$(get_context); count=$press_count"
   log_recovery "button=exit count=$press_count context=$(get_context) action=exit"
+  invalidate_screensaver
 
   if [ "$press_count" -ge "$PANIC_PRESS_THRESHOLD" ] 2>/dev/null; then
     recover_exit_panic_local "exit" "$press_count"
@@ -859,6 +868,7 @@ do_exit() {
 
 do_launch_steamlink() {
   log "launch steamlink requested; context=$(get_context)"
+  invalidate_screensaver
   state_request steamlink || true
   state_phase client-starting --application steamlink || true
   set_input_profile "passthrough"
@@ -911,6 +921,7 @@ do_launch_steamlink() {
 
 do_launch_mariokart64() {
   log "launch mariokart64 requested; context=$(get_context)"
+  invalidate_screensaver
   state_request mariokart64 || true
   state_phase client-starting --application mariokart64 || true
   set_input_profile "passthrough"
