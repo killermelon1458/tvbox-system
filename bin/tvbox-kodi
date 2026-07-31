@@ -1,7 +1,6 @@
 #!/bin/bash
 set -u
 
-LOCK="/tmp/tvbox-kodi-launch.lock"
 LOG="/home/tvbox/.cache/tvbox-kodi.log"
 
 mkdir -p /home/tvbox/.cache
@@ -11,7 +10,11 @@ mkdir -p /home/tvbox/.cache
 export HOME=/home/tvbox
 export USER=tvbox
 export LOGNAME=tvbox
-export XDG_RUNTIME_DIR=/run/user/1000
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+RUNTIME_ROOT="${TVBOX_RUNTIME_ROOT:-$XDG_RUNTIME_DIR/tvbox}"
+mkdir -p "$RUNTIME_ROOT"
+chmod 700 "$RUNTIME_ROOT" 2>/dev/null || true
+LOCK="$RUNTIME_ROOT/kodi-launch.lock"
 export DISPLAY="${DISPLAY:-:0}"
 
 if [ -z "${WAYLAND_DISPLAY:-}" ]; then
@@ -39,7 +42,7 @@ open_favourites() {
 if kodi_running; then
   log "Kodi already running; opening Favourites."
   open_favourites
-  /usr/local/bin/tvboxctl set-context kodi >/dev/null 2>&1 || true
+  /usr/local/bin/tvbox-state reconcile kodi --wait 3 >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -52,7 +55,7 @@ fi
 if kodi_running; then
   log "Kodi appeared while acquiring launch path; opening Favourites."
   open_favourites
-  /usr/local/bin/tvboxctl set-context kodi >/dev/null 2>&1 || true
+  /usr/local/bin/tvbox-state reconcile kodi --wait 3 >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -72,7 +75,12 @@ log "Launching Kodi with ALSA backend."
 
 kodi_pid=$!
 log "Kodi supervisor started with PID $kodi_pid."
-/usr/local/bin/tvboxctl set-context kodi >/dev/null 2>&1 || true
+(
+  exec 9>&-
+  if /usr/local/bin/tvbox-state reconcile kodi --wait 15 >> "$LOG" 2>&1; then
+    /usr/local/bin/tvbox-state monitor kodi --recover-kodi >> "$LOG" 2>&1
+  fi
+) &
 
 sleep 2
 exit 0

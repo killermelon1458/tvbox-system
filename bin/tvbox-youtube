@@ -22,8 +22,13 @@ if [ -z "${WAYLAND_DISPLAY:-}" ]; then
 fi
 
 export DISPLAY="${DISPLAY:-:0}"
+RUNTIME_ROOT="${TVBOX_RUNTIME_ROOT:-$XDG_RUNTIME_DIR/tvbox}"
+mkdir -p "$RUNTIME_ROOT"
+chmod 700 "$RUNTIME_ROOT" 2>/dev/null || true
 
 /usr/local/bin/tvbox-inputctl set-profile controller_kbm_generic 2>/tmp/tvbox-inputctl-youtube.log || true
+/usr/local/bin/tvbox-state ensure-request youtube >/dev/null 2>&1 || true
+/usr/local/bin/tvbox-state phase client-starting --application youtube >/dev/null 2>&1 || true
 
 # Close Kodi so Chromium gets the screen/audio/input resources.
 pkill -TERM -x kodi 2>/dev/null
@@ -42,6 +47,7 @@ if [ ! -x "$CHROME" ]; then
     exit 1
 fi
 
+/usr/local/bin/tvbox-state phase client-starting --application youtube >/dev/null 2>&1 || true
 "$CHROME" \
   --user-data-dir="$PROFILE" \
   --no-first-run \
@@ -49,7 +55,21 @@ fi
   --password-store=basic \
   --start-fullscreen \
   --user-agent="Mozilla/5.0 (SMART-TV; Linux; Tizen 7.0) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/5.0 Chrome/108.0.0.0 Safari/537.36" \
-  --app="https://www.youtube.com/tv"
+  --app="https://www.youtube.com/tv" &
+chrome_pid=$!
+/usr/local/bin/tvbox-state attach-pid "$chrome_pid" >/dev/null 2>&1 || true
+/usr/local/bin/tvbox-state reconcile youtube --wait 20 >/dev/null 2>&1 || true
+wait "$chrome_pid"
+chrome_rc=$?
+/usr/local/bin/tvbox-state client-exit youtube "$chrome_rc" >/dev/null 2>&1 || true
 
 # When Chromium exits, relaunch Kodi through the known-good wrapper.
+if /usr/local/bin/tvbox-state is-stable kodi >/dev/null 2>&1; then
+  exit "$chrome_rc"
+fi
+/usr/local/bin/tvbox-state ensure-request kodi >/dev/null 2>&1 || true
+/usr/local/bin/tvbox-state phase returning --application kodi >/dev/null 2>&1 || true
 /usr/local/bin/tvbox-kodi
+/usr/local/bin/tvbox-state reconcile kodi --returning --wait 15 >/dev/null 2>&1 || \
+  /usr/local/bin/tvbox-state fail youtube-kodi-return-failed >/dev/null 2>&1 || true
+exit "$chrome_rc"

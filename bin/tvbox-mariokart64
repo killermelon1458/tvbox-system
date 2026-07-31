@@ -4,21 +4,30 @@ set -u
 export HOME=/home/tvbox
 export USER=tvbox
 export LOGNAME=tvbox
-export XDG_RUNTIME_DIR=/run/user/1000
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export WAYLAND_DISPLAY=wayland-0
-export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 export SDL_VIDEODRIVER=wayland
 export SDL_AUDIODRIVER=alsa
 
 cleanup() {
   pkill -TERM -x mupen64plus 2>/dev/null || true
   sleep 1
+  if /usr/local/bin/tvbox-state is-stable kodi >/dev/null 2>&1; then
+    return 0
+  fi
+  /usr/local/bin/tvbox-state ensure-request kodi >/dev/null 2>&1 || true
+  /usr/local/bin/tvbox-state phase returning --application kodi >/dev/null 2>&1 || true
   /usr/local/bin/tvbox-kodi
+  /usr/local/bin/tvbox-state reconcile kodi --returning --wait 15 >/dev/null 2>&1 || \
+    /usr/local/bin/tvbox-state fail mariokart64-kodi-return-failed >/dev/null 2>&1 || true
 }
 
 trap cleanup INT TERM EXIT
 
 /usr/local/bin/tvbox-stop-spotify 2>/tmp/tvbox-stop-spotify.log || true
+/usr/local/bin/tvbox-state ensure-request mariokart64 >/dev/null 2>&1 || true
+/usr/local/bin/tvbox-state phase client-starting --application mariokart64 >/dev/null 2>&1 || true
 
 pkill -TERM -x kodi 2>/dev/null || true
 pkill -TERM -x kodi.bin 2>/dev/null || true
@@ -33,8 +42,14 @@ sleep 2
   --audio mupen64plus-audio-sdl.so \
   --input mupen64plus-input-sdl.so \
   --rsp mupen64plus-rsp-hle.so \
-  "/home/tvbox/Games/ROMs/N64/Mario Kart 64 (USA).z64"
+  "/home/tvbox/Games/ROMs/N64/Mario Kart 64 (USA).z64" &
+emulator_pid=$!
+/usr/local/bin/tvbox-state attach-pid "$emulator_pid" >/dev/null 2>&1 || true
+/usr/local/bin/tvbox-state reconcile mariokart64 --wait 12 >/dev/null 2>&1 || true
+wait "$emulator_pid"
+emulator_rc=$?
+/usr/local/bin/tvbox-state client-exit mariokart64 "$emulator_rc" >/dev/null 2>&1 || true
 
 trap - INT TERM EXIT
-/usr/local/bin/tvbox-kodi
-
+cleanup
+exit "$emulator_rc"

@@ -1,0 +1,654 @@
+#!/usr/bin/python3
+"""TVBox boot-local application state and bounded reconciliation."""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+SCHEMA_VERSION = 1
+APPLICATIONS = {"kodi", "moonlight", "steamlink", "youtube", "mariokart64",
+                "spotify", "desktop", "unknown"}
+PHASES = {"absent", "launch-requested", "client-starting", "menu-loading",
+          "menu-ready", "content-loading", "stream-requested",
+          "stream-connecting", "streaming", "ready", "disconnecting",
+          "returning", "failed", "unknown"}
+PHASES.update({"emulator-starting", "desktop-gap", "browser-window",
+               "page-loading", "splash", "failure-dialog"})
+DEFAULT_DEADLINES = {
+    "kodi": 15.0, "moonlight": 15.0, "steamlink": 20.0,
+    "youtube": 20.0, "mariokart64": 12.0,
+}
+STABILITY_SECONDS = {"moonlight": 0.5, "steamlink": 0.75, "youtube": 0.75}
+WRITER_ID = f"{os.getpid()}-{uuid.uuid4()}"
+
+
+def runtime_root():
+    override = os.environ.get("TVBOX_RUNTIME_ROOT")
+    if override:
+        root = Path(override)
+    else:
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if not xdg:
+            raise RuntimeError("XDG_RUNTIME_DIR is required")
+        root = Path(xdg) / "tvbox"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+def boot_id():
+    override = os.environ.get("TVBOX_BOOT_ID")
+    if override:
+        return override
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return "unknown"
+
+
+def now_fields():
+    return {
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "updated_monotonic": time.monotonic(),
+        "boot_id": boot_id(),
+        "writer_instance": WRITER_ID,
+    }
+
+
+def atomic_write(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def read_state(name):
+    path = runtime_root() / name
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            return None
+        if value.get("schema_version") != SCHEMA_VERSION:
+            return None
+        if value.get("boot_id") != boot_id():
+            return None
+        return value
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def write_state(name, fields):
+    value = {"schema_version": SCHEMA_VERSION, **fields, **now_fields()}
+    atomic_write(runtime_root() / name, value)
+    return value
+
+
+def profile_observation(previous=None):
+    root = runtime_root()
+    candidates = [
+        root / "active-profile",
+        root / "input-profile",
+        Path(os.environ.get("TVBOX_INPUT_PROFILE_FILE", "/dev/null")),
+    ]
+    profile = "unknown"
+    changed_at = None
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                profile = text
+                changed_at = path.stat().st_mtime
+                break
+        except OSError:
+            continue
+    previous_profile = (previous or {}).get("input_profile")
+    return {
+        "input_profile": profile,
+        "input_profile_source": str(path) if profile != "unknown" else None,
+        "input_profile_changed_at": changed_at,
+        "input_profile_changed_during_transition":
+            bool(previous_profile and previous_profile != profile),
+    }
+
+
+def log_event(event, **fields):
+    log_path = Path(os.environ.get(
+        "TVBOX_TRANSITION_LOG",
+        str(Path.home() / ".cache" / "tvbox-transition.log"),
+    ))
+    try:
+        log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                  "event": event, **fields}
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+        os.chmod(log_path, 0o600)
+    except OSError:
+        pass
+
+
+def proc_start_time(pid):
+    try:
+        # The command name may contain spaces or parentheses; split after final ')'.
+        fields = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_facts(pid):
+    if not pid:
+        return None
+    start = proc_start_time(pid)
+    if start is None:
+        return None
+    try:
+        executable = os.readlink(f"/proc/{int(pid)}/exe")
+        command = Path(f"/proc/{int(pid)}/cmdline").read_bytes().split(b"\0")
+        command = [part.decode("utf-8", "replace") for part in command if part]
+    except OSError:
+        return None
+    return {"pid": int(pid), "start_time_ticks": start,
+            "executable": executable, "command": command}
+
+
+def claim_valid(claim, application):
+    facts = proc_facts((claim or {}).get("pid"))
+    if not facts or facts["start_time_ticks"] != (claim or {}).get("start_time_ticks"):
+        return False
+    base = Path(facts["executable"]).name
+    command = "\0".join(facts["command"])
+    if application == "kodi":
+        return base in {"kodi", "kodi.bin"}
+    if application == "steamlink":
+        return base == "steamlink"
+    if application == "moonlight":
+        return base in {"moonlight", "moonlight-qt"}
+    if application == "mariokart64":
+        return base == "mupen64plus"
+    if application == "youtube":
+        profile = os.environ.get(
+            "TVBOX_YOUTUBE_PROFILE", str(Path.home() / ".config/chromium-tvbox-youtube"))
+        return base.startswith("chromium") and (
+            f"--user-data-dir={profile}" in command
+            or "chromium-tvbox-youtube" in command
+        )
+    return False
+
+
+def exact_processes(application):
+    matches = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return matches
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        facts = proc_facts(int(entry.name))
+        if not facts:
+            continue
+        if claim_valid(facts, application):
+            matches.append(facts)
+    return matches
+
+
+def toplevel_lines():
+    override = os.environ.get("TVBOX_TOPLEVELS_FILE")
+    if override:
+        try:
+            return Path(override).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+    for command in (["wlrctl", "toplevel", "list"], ["wlrctl", "window", "list"]):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=2, check=False)
+            if result.returncode == 0:
+                return result.stdout.splitlines()
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return []
+
+
+def matching_toplevel(application, lines):
+    text = "\n".join(lines).lower()
+    patterns = {
+        "kodi": ("kodi:", "app_id:kodi", "kodi from debian"),
+        "moonlight": ("moonlight:", "com.moonlight_stream.moonlight"),
+        "steamlink": ("shell: steamlink", "streaming client", "[streaming]"),
+        "youtube": ("youtube on tv", "www.youtube.com__tv", "chromium-tvbox"),
+        "mariokart64": ("mupen64plus",),
+    }
+    return any(pattern in text for pattern in patterns.get(application, ()))
+
+
+def observe(application, request=None):
+    lines = toplevel_lines()
+    claim = (request or {}).get("process_claim")
+    claim_ok = claim_valid(claim, application)
+    processes = exact_processes(application)
+    process_observed = claim_ok or bool(processes)
+    top = matching_toplevel(application, lines)
+    conflicts = [
+        app for app in ("moonlight", "steamlink", "youtube", "mariokart64", "kodi")
+        if app != application and matching_toplevel(app, lines)
+    ]
+    previous = read_state("observed-state.json")
+    fields = {
+        "application": application,
+        "request_id": (request or {}).get("request_id"),
+        "process_claim": claim,
+        "process_claim_valid": claim_ok,
+        "process_observed": process_observed,
+        "processes": processes,
+        "toplevel_observed": top,
+        "conflicting_toplevels": conflicts,
+        "toplevels": lines,
+        **profile_observation(previous),
+    }
+    return write_state("observed-state.json", fields)
+
+
+def active_context_path():
+    return runtime_root() / "active-context"
+
+
+def commit_stable(application, foreground_view, confidence, request_id=None):
+    stable = write_state("stable-state.json", {
+        "application": application,
+        "foreground_view": foreground_view,
+        "confidence": confidence,
+        "request_id": request_id,
+    })
+    path = active_context_path()
+    fd, temporary = tempfile.mkstemp(prefix=".active-context.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(application + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    log_event("stable-committed", request_id=request_id,
+              final_stable_state=application, acceptance_decision="accepted")
+    return stable
+
+
+def request(application, target=None, deadline=None):
+    if application not in APPLICATIONS:
+        raise ValueError(f"unsupported application: {application}")
+    request_id = str(uuid.uuid4())
+    started = time.monotonic()
+    previous = read_state("stable-state.json")
+    req = write_state("lifecycle-request.json", {
+        "request_id": request_id,
+        "requested_application": application,
+        "requested_target": target,
+        "requested_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "started_monotonic": started,
+        "previous_stable_context": (previous or {}).get("application", "unknown"),
+    })
+    write_state("transition-state.json", {
+        "request_id": request_id,
+        "application": application,
+        "phase": "launch-requested",
+        "state": "active",
+        "started_monotonic": started,
+        "deadline_monotonic": started + (
+            deadline if deadline is not None else DEFAULT_DEADLINES.get(application, 15.0)),
+        "failure_reason": None,
+    })
+    log_event("request", request_id=request_id, requested_application=application,
+              requested_target=target,
+              previous_stable_context=req["previous_stable_context"],
+              transition_phase="launch-requested")
+    return req
+
+
+def ensure_request(application, target=None, deadline=None):
+    transition = read_state("transition-state.json")
+    req = read_state("lifecycle-request.json")
+    if (transition and req
+            and transition.get("state") == "active"
+            and transition.get("application") == application
+            and transition.get("request_id") == req.get("request_id")):
+        return req
+    return request(application, target, deadline)
+
+
+def set_phase(phase, state="active", failure_reason=None, application=None):
+    if phase not in PHASES:
+        raise ValueError(f"unsupported phase: {phase}")
+    transition = read_state("transition-state.json") or {}
+    if application and not transition:
+        started = time.monotonic()
+        transition = {
+            "request_id": str(uuid.uuid4()), "application": application,
+            "started_monotonic": started,
+            "deadline_monotonic": started + DEFAULT_DEADLINES.get(application, 15.0),
+        }
+    transition.update({"phase": phase, "state": state,
+                       "failure_reason": failure_reason})
+    value = write_state("transition-state.json", {
+        key: val for key, val in transition.items()
+        if key not in {"schema_version", "updated_at", "updated_monotonic",
+                       "boot_id", "writer_instance"}
+    })
+    log_event("transition", request_id=value.get("request_id"),
+              requested_application=value.get("application"),
+              transition_phase=phase, failure_reason=failure_reason,
+              current_input_profile=profile_observation().get("input_profile"))
+    return value
+
+
+def attach_pid(pid):
+    transition = read_state("transition-state.json")
+    request_state = read_state("lifecycle-request.json")
+    if not transition or not request_state:
+        raise RuntimeError("no active lifecycle request")
+    facts = proc_facts(pid)
+    if not facts:
+        raise RuntimeError(f"pid {pid} does not exist")
+    request_state["process_claim"] = facts
+    return write_state("lifecycle-request.json", {
+        key: val for key, val in request_state.items()
+        if key not in {"schema_version", "updated_at", "updated_monotonic",
+                       "boot_id", "writer_instance"}
+    })
+
+
+def fail(reason):
+    transition = set_phase("failed", state="failed", failure_reason=reason)
+    write_state("failure-state.json", {
+        "request_id": transition.get("request_id"),
+        "application": transition.get("application"),
+        "phase": transition.get("phase"),
+        "failure_reason": reason,
+        "failed_monotonic": time.monotonic(),
+    })
+    log_event("failure", request_id=transition.get("request_id"),
+              failure_reason=reason, acceptance_decision="rejected")
+    return transition
+
+
+def client_exit(application, exit_code):
+    transition = read_state("transition-state.json")
+    stable = read_state("stable-state.json")
+    if transition and transition.get("application") != application:
+        log_event("client-exit-superseded", requested_application=application,
+                  failure_reason=f"exit:{exit_code}",
+                  recovery_action=transition.get("phase"))
+        return None
+    if not transition and (stable or {}).get("application") != application:
+        return None
+    return fail(f"{application}-client-exit:{exit_code}")
+
+
+def clear_transition():
+    path = runtime_root() / "transition-state.json"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def acceptance(application, observed, elapsed):
+    process_ok = observed["process_observed"]
+    top_ok = observed["toplevel_observed"]
+    if application == "kodi":
+        return (process_ok and top_ok and not observed.get("conflicting_toplevels"),
+                "ready", "application", "high")
+    if application == "moonlight":
+        return (process_ok and top_ok and elapsed >= STABILITY_SECONDS["moonlight"],
+                "menu-ready", "menu", "high")
+    if application == "steamlink":
+        return (process_ok and top_ok and elapsed >= STABILITY_SECONDS["steamlink"],
+                "menu-ready", "menu", "high")
+    if application == "youtube":
+        return (process_ok and top_ok and elapsed >= STABILITY_SECONDS["youtube"],
+                "menu-ready", "browser-window", "medium")
+    if application == "mariokart64":
+        return False, "content-loading" if process_ok else "emulator-starting", "splash", "low"
+    return False, "unknown", "unknown", "low"
+
+
+def reconcile(application=None, wait=0.0, interval=0.2, returning=False):
+    transition = read_state("transition-state.json")
+    req = read_state("lifecycle-request.json")
+    application = application or (transition or {}).get("application")
+    if not application:
+        return reconcile_startup()
+    if transition and transition.get("application") != application:
+        return 1
+    if not transition:
+        request(application, deadline=max(wait, DEFAULT_DEADLINES.get(application, 15.0)))
+        transition = read_state("transition-state.json")
+        req = read_state("lifecycle-request.json")
+    started = time.monotonic()
+    deadline = started + max(0.0, wait)
+    stable_since = None
+    while True:
+        observed = observe(application, req)
+        process_ok = observed["process_observed"]
+        top_ok = observed["toplevel_observed"]
+        if process_ok and top_ok:
+            stable_since = stable_since or time.monotonic()
+        else:
+            stable_since = None
+        elapsed = 0.0 if stable_since is None else time.monotonic() - stable_since
+        accepted, phase, view, confidence = acceptance(application, observed, elapsed)
+        if returning and application == "kodi" and not accepted:
+            phase = "returning"
+        set_phase(phase, application=application)
+        if accepted:
+            current_transition = read_state("transition-state.json")
+            # A newer Home/request invalidates this launch acceptance.
+            if transition:
+                if current_transition and (
+                        current_transition.get("request_id") != transition.get("request_id")):
+                    return 1
+                if not current_transition:
+                    current_stable = read_state("stable-state.json")
+                    if (current_stable or {}).get("application") == application:
+                        return 0
+                    return 1
+            commit_stable(application, view, confidence,
+                          (transition or {}).get("request_id"))
+            clear_transition()
+            return 0
+        now = time.monotonic()
+        transition_deadline = (transition or {}).get("deadline_monotonic", deadline)
+        if now >= deadline or now >= transition_deadline:
+            if application == "mariokart64" and process_ok and top_ok:
+                # No authoritative ready signal exists; keep loading observable.
+                return 2
+            if not process_ok:
+                fail("required-process-exited-before-acceptance")
+            elif not top_ok:
+                fail("required-toplevel-deadline")
+            else:
+                fail("acceptance-deadline")
+            return 1
+        time.sleep(interval)
+
+
+def reconcile_startup():
+    # read_state rejects malformed, unsupported, and prior-boot claims.
+    lines = toplevel_lines()
+    for app, view in (("moonlight", "menu"), ("steamlink", "menu"),
+                      ("youtube", "browser-window")):
+        if exact_processes(app) and matching_toplevel(app, lines):
+            commit_stable(app, view, "medium")
+            clear_transition()
+            return 0
+    if exact_processes("kodi") and matching_toplevel("kodi", lines):
+        commit_stable("kodi", "application", "high")
+        clear_transition()
+        return 0
+    application = "desktop" if lines else "unknown"
+    commit_stable(application, "desktop-gap", "low")
+    clear_transition()
+    return 0
+
+
+def dump_status():
+    value = {
+        "runtime_root": str(runtime_root()),
+        "request": read_state("lifecycle-request.json"),
+        "transition": read_state("transition-state.json"),
+        "observed": read_state("observed-state.json"),
+        "stable": read_state("stable-state.json"),
+        "failure": read_state("failure-state.json"),
+    }
+    print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    request_parser = sub.add_parser("request")
+    request_parser.add_argument("application", choices=sorted(APPLICATIONS))
+    request_parser.add_argument("target", nargs="?")
+    request_parser.add_argument("--deadline", type=float)
+    ensure_parser = sub.add_parser("ensure-request")
+    ensure_parser.add_argument("application", choices=sorted(APPLICATIONS))
+    ensure_parser.add_argument("target", nargs="?")
+    ensure_parser.add_argument("--deadline", type=float)
+    phase_parser = sub.add_parser("phase")
+    phase_parser.add_argument("phase", choices=sorted(PHASES))
+    phase_parser.add_argument("--application", choices=sorted(APPLICATIONS))
+    phase_parser.add_argument("--reason")
+    pid_parser = sub.add_parser("attach-pid")
+    pid_parser.add_argument("pid", type=int)
+    reconcile_parser = sub.add_parser("reconcile")
+    reconcile_parser.add_argument("application", nargs="?", choices=sorted(APPLICATIONS))
+    reconcile_parser.add_argument("--wait", type=float, default=0.0)
+    reconcile_parser.add_argument("--returning", action="store_true")
+    sub.add_parser("startup")
+    failure_parser = sub.add_parser("fail")
+    failure_parser.add_argument("reason")
+    exit_parser = sub.add_parser("client-exit")
+    exit_parser.add_argument("application", choices=sorted(APPLICATIONS))
+    exit_parser.add_argument("exit_code", type=int)
+    sub.add_parser("clear")
+    sub.add_parser("clear-failure")
+    sub.add_parser("status")
+    stable_parser = sub.add_parser("is-stable")
+    stable_parser.add_argument("application", choices=sorted(APPLICATIONS))
+    observe_parser = sub.add_parser("observe")
+    observe_parser.add_argument("application", choices=sorted(APPLICATIONS))
+    pids_parser = sub.add_parser("pids")
+    pids_parser.add_argument("application", choices=sorted(APPLICATIONS))
+    monitor_parser = sub.add_parser("monitor")
+    monitor_parser.add_argument("application", choices=sorted(APPLICATIONS))
+    monitor_parser.add_argument("--recover-kodi", action="store_true")
+    monitor_parser.add_argument("--interval", type=float, default=0.5)
+    args = parser.parse_args(argv)
+    if args.command == "request":
+        print(request(args.application, args.target, args.deadline)["request_id"])
+    elif args.command == "ensure-request":
+        print(ensure_request(args.application, args.target,
+                             args.deadline)["request_id"])
+    elif args.command == "phase":
+        set_phase(args.phase, failure_reason=args.reason,
+                  state="failed" if args.phase == "failed" else "active",
+                  application=args.application)
+    elif args.command == "attach-pid":
+        attach_pid(args.pid)
+    elif args.command == "reconcile":
+        return reconcile(args.application, args.wait, returning=args.returning)
+    elif args.command == "startup":
+        return reconcile_startup()
+    elif args.command == "fail":
+        fail(args.reason)
+    elif args.command == "client-exit":
+        client_exit(args.application, args.exit_code)
+    elif args.command == "clear":
+        clear_transition()
+    elif args.command == "clear-failure":
+        try:
+            (runtime_root() / "failure-state.json").unlink()
+        except FileNotFoundError:
+            pass
+    elif args.command == "status":
+        dump_status()
+    elif args.command == "is-stable":
+        stable = read_state("stable-state.json")
+        transition = read_state("transition-state.json")
+        return 0 if (stable or {}).get("application") == args.application and not transition else 1
+    elif args.command == "observe":
+        print(json.dumps(observe(args.application,
+                                 read_state("lifecycle-request.json")),
+                         sort_keys=True))
+    elif args.command == "pids":
+        for process in exact_processes(args.application):
+            print(process["pid"])
+    elif args.command == "monitor":
+        lock_path = runtime_root() / f"monitor-{args.application}.lock"
+        lock_stream = lock_path.open("a+")
+        try:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_stream.close()
+            return 0
+        stable = read_state("stable-state.json")
+        request_id = (stable or {}).get("request_id")
+        while True:
+            current = read_state("stable-state.json")
+            active_transition = read_state("transition-state.json")
+            if active_transition and (
+                    active_transition.get("application") != args.application):
+                lock_stream.close()
+                return 0
+            if (current or {}).get("application") != args.application:
+                lock_stream.close()
+                return 0
+            if request_id and current.get("request_id") != request_id:
+                lock_stream.close()
+                return 0
+            observed = observe(args.application, read_state("lifecycle-request.json"))
+            if not observed["process_observed"] or not observed["toplevel_observed"]:
+                fail(f"{args.application}-exited-after-acceptance")
+                if args.recover_kodi:
+                    try:
+                        subprocess.Popen(
+                            [os.environ.get("TVBOXCTL", "/usr/local/bin/tvboxctl"),
+                             "home"],
+                            close_fds=True,
+                        )
+                    except OSError:
+                        pass
+                lock_stream.close()
+                return 1
+            time.sleep(max(0.1, args.interval))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

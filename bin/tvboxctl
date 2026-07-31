@@ -7,7 +7,7 @@ CONFIG="/etc/tvboxctl.conf"
 # Defaults. /etc/tvboxctl.conf can override these.
 TVBOX_USER="tvbox"
 TVBOX_UID="1000"
-STATE_DIR="/run/user/1000/tvbox"
+STATE_DIR=""
 FALLBACK_STATE_DIR="/tmp/tvbox"
 LOG_DIR="/home/tvbox/.cache"
 
@@ -26,19 +26,27 @@ MOONLIGHT_HOST="192.168.1.189"
 STEAMLINK_BIN="/usr/bin/steamlink"
 MARIOKART64_WRAPPER="/usr/local/bin/tvbox-mariokart64"
 INPUTCTL="/usr/local/bin/tvbox-inputctl"
+STATECTL="/usr/local/bin/tvbox-state"
 
 MAX_PRESERVED_APPS=0
 EXIT_CLOSES_KODI=0
+INPUT_RECOVERY_PRESERVE_EXISTING_BEHAVIOR=1
+INPUT_RECOVERY_ON_TRANSITION_FAILURE="restore-kodi-after-kodi-ready"
 
 if [ -f "$CONFIG" ]; then
   # shellcheck source=/dev/null
   . "$CONFIG"
 fi
 
+if [ -z "$STATE_DIR" ]; then
+  STATE_DIR="${TVBOX_RUNTIME_ROOT:-${XDG_RUNTIME_DIR:-/run/user/$TVBOX_UID}/tvbox}"
+fi
+
 if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
   STATE_DIR="$FALLBACK_STATE_DIR"
   mkdir -p "$STATE_DIR"
 fi
+chmod 700 "$STATE_DIR" 2>/dev/null || true
 
 mkdir -p "$LOG_DIR"
 
@@ -370,11 +378,87 @@ set_context() {
   local ctx="${1:-unknown}"
   local profile
 
+  if [ -x "$STATECTL" ]; then
+    case "$ctx" in
+      kodi|moonlight|steamlink|youtube|mariokart64)
+        "$STATECTL" startup >/dev/null 2>&1 || true
+        if [ "$(get_context)" != "$ctx" ]; then
+          log "active-context not committed: $ctx acceptance predicate failed"
+          return 1
+        fi
+        ;;
+      *)
+        printf '%s\n' "$ctx" > "$ACTIVE_CONTEXT_FILE"
+        ;;
+    esac
+  else
+    printf '%s\n' "$ctx" > "$ACTIVE_CONTEXT_FILE"
+  fi
+
   profile="$(input_profile_for_context "$ctx")"
   set_input_profile "$profile"
-
-  printf '%s\n' "$ctx" > "$ACTIVE_CONTEXT_FILE"
   log "active-context=$ctx"
+}
+
+state_request() {
+  [ -x "$STATECTL" ] || return 0
+  "$STATECTL" request "$@" >/dev/null
+}
+
+state_ensure_request() {
+  [ -x "$STATECTL" ] || return 0
+  "$STATECTL" ensure-request "$@" >/dev/null
+}
+
+state_phase() {
+  [ -x "$STATECTL" ] || return 0
+  "$STATECTL" phase "$@" >/dev/null
+}
+
+return_to_kodi() {
+  local reason="${1:-return}"
+
+  log "$reason: beginning bounded Kodi return"
+  state_ensure_request kodi || true
+  state_phase returning --application kodi || true
+  show_kodi
+  if [ -x "$STATECTL" ] && "$STATECTL" reconcile kodi --returning --wait 15; then
+    set_input_profile "kodi_native_minimal"
+    clear_preserved
+    start_bg "$STATECTL" monitor kodi --recover-kodi
+    return 0
+  fi
+
+  log "$reason: first Kodi readiness wait failed; retrying canonical wrapper once"
+  show_kodi
+  if [ -x "$STATECTL" ] && "$STATECTL" reconcile kodi --returning --wait 15; then
+    set_input_profile "kodi_native_minimal"
+    clear_preserved
+    start_bg "$STATECTL" monitor kodi --recover-kodi
+    return 0
+  fi
+
+  log "$reason: bounded Kodi recovery failed"
+  [ -x "$STATECTL" ] && "$STATECTL" fail "kodi-recovery-failed:$reason" >/dev/null 2>&1 || true
+  return 1
+}
+
+recover_transition_failure() {
+  local reason="${1:-transition-failure}"
+
+  case "$INPUT_RECOVERY_ON_TRANSITION_FAILURE" in
+    restore-kodi-after-kodi-ready)
+      return_to_kodi "$reason"
+      ;;
+    none)
+      log "$reason: automatic Kodi recovery disabled by configuration"
+      return 1
+      ;;
+    *)
+      log "$reason: unknown input recovery setting: $INPUT_RECOVERY_ON_TRANSITION_FAILURE"
+      return 1
+      ;;
+  esac
 }
 
 get_preserved() {
@@ -489,7 +573,7 @@ start_steamlink_bg() {
       HOME=/home/tvbox \
       USER=tvbox \
       LOGNAME=tvbox \
-      XDG_RUNTIME_DIR=/run/user/1000 \
+      XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$TVBOX_UID}" \
       WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
       DISPLAY="${DISPLAY:-:0}" \
       "$STEAMLINK_BIN" >> "$LOG_DIR/tvbox-steamlink.log" 2>&1
@@ -553,23 +637,21 @@ STATUS
 
 
 close_youtube_current() {
-  # Current stable behavior was broad chromium close.
-  # tvboxctl uses narrower matching so Spotify/loading Chromium profiles are not killed.
-  if pgrep -f "chromium.*chromium-tvbox-youtube" >/dev/null 2>&1; then
-    pkill -TERM -f "chromium.*chromium-tvbox-youtube" 2>/dev/null || true
-    sleep 2
-    pkill -KILL -f "chromium.*chromium-tvbox-youtube" 2>/dev/null || true
-    return 0
-  fi
+  local pid found=1
 
-  if pgrep -f "chromium.*${YOUTUBE_PROFILE}" >/dev/null 2>&1; then
-    pkill -TERM -f "chromium.*${YOUTUBE_PROFILE}" 2>/dev/null || true
-    sleep 2
-    pkill -KILL -f "chromium.*${YOUTUBE_PROFILE}" 2>/dev/null || true
-    return 0
-  fi
-
-  return 1
+  [ -x "$STATECTL" ] || return 1
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+    found=0
+  done < <("$STATECTL" pids youtube)
+  [ "$found" -eq 0 ] || return 1
+  sleep 2
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    kill -KILL "$pid" 2>/dev/null || true
+  done < <("$STATECTL" pids youtube)
+  return 0
 }
 
 reconcile_context() {
@@ -611,14 +693,15 @@ do_home() {
     exit 0
   fi
 
+  state_request kodi || true
+  state_phase returning --application kodi || true
+
   # Mupen64Plus mode: close the emulator and return to Kodi.
   if mariokart64_running; then
     log "home: mariokart64/mupen64plus detected; closing emulator and returning Kodi"
     pkill -TERM -x mupen64plus 2>/dev/null || true
     sleep 1
-    show_kodi
-    set_context "kodi"
-    clear_preserved
+    return_to_kodi "home-mariokart64"
     exit 0
   fi
 
@@ -632,11 +715,10 @@ do_home() {
     # If Moonlight was launched outside the tvbox-moonlight wrapper, fall back to Kodi here.
     if ! pgrep -f '/usr/local/bin/tvbox-moonlight' >/dev/null 2>&1; then
       log "home: no tvbox-moonlight wrapper detected; launching Kodi"
-      show_kodi
-      set_context "kodi"
+      return_to_kodi "home-moonlight"
     else
-      log "home: tvbox-moonlight wrapper detected; allowing wrapper to return Kodi"
-      set_context "kodi"
+      log "home: wrapper will also return Kodi; asserting bounded readiness here"
+      return_to_kodi "home-moonlight-wrapper"
     fi
 
     exit 0
@@ -647,9 +729,7 @@ do_home() {
     log "home: spotify mode detected; stopping Spotify and returning Kodi"
     "$SPOTIFY_STOP" 2>/tmp/tvbox-stop-spotify.log || true
     sleep 1
-    show_kodi
-    set_context "kodi"
-    clear_preserved
+    return_to_kodi "home-spotify"
     exit 0
   fi
 
@@ -659,9 +739,7 @@ do_home() {
     log "home: steamlink detected; closing Steam Link and returning Kodi"
     close_steamlink_current || true
     sleep 1
-    show_kodi
-    set_context "kodi"
-    clear_preserved
+    return_to_kodi "home-steamlink"
     exit 0
   fi
 
@@ -674,8 +752,7 @@ do_home() {
     sleep 1
     kodi-send --action="ActivateWindow(FavouritesBrowser)" >/dev/null 2>&1 || true
     mark_kodi_favourites
-    show_kodi
-    set_context "kodi"
+    return_to_kodi "home-kodi"
     exit 0
   fi
 
@@ -684,15 +761,13 @@ do_home() {
   if youtube_running; then
     log "home: youtube detected; closing YouTube Chromium"
     close_youtube_current || true
-    set_context "kodi"
-    clear_preserved
+    return_to_kodi "home-youtube"
     exit 0
   fi
 
   # Fallback: launch Kodi.
   log "home: no known active app; launching Kodi"
-  show_kodi
-  set_context "kodi"
+  return_to_kodi "home-fallback"
 }
 
 do_exit() {
@@ -784,12 +859,14 @@ do_exit() {
 
 do_launch_steamlink() {
   log "launch steamlink requested; context=$(get_context)"
+  state_request steamlink || true
+  state_phase client-starting --application steamlink || true
   set_input_profile "passthrough"
 
   if steamlink_running; then
     log "launch steamlink: already running; focusing existing window"
     focus_steamlink
-    set_context "steamlink"
+    "$STATECTL" reconcile steamlink --wait 2 || true
     exit 0
   fi
 
@@ -821,48 +898,53 @@ do_launch_steamlink() {
   log "launch steamlink: starting $STEAMLINK_BIN"
   start_steamlink_bg
 
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 0.5
-    if steamlink_running; then
-      focus_steamlink
-      set_context "steamlink"
-      exit 0
-    fi
-  done
+  if "$STATECTL" reconcile steamlink --wait 20; then
+    focus_steamlink
+    start_bg "$STATECTL" monitor steamlink --recover-kodi
+    exit 0
+  fi
 
-  log "launch steamlink: start requested but no SteamLink window/process detected"
-  set_context "steamlink"
+  log "launch steamlink: acceptance failed; returning to Kodi"
+  close_steamlink_current || true
+  recover_transition_failure "steamlink-launch-failure"
 }
 
 do_launch_mariokart64() {
   log "launch mariokart64 requested; context=$(get_context)"
+  state_request mariokart64 || true
+  state_phase client-starting --application mariokart64 || true
   set_input_profile "passthrough"
 
   if mariokart64_running; then
     log "launch mariokart64: already running"
-    set_context "mariokart64"
+    state_phase content-loading --application mariokart64 || true
     exit 0
   fi
 
   if [ ! -x "$MARIOKART64_WRAPPER" ]; then
     log "launch mariokart64: wrapper missing or not executable: $MARIOKART64_WRAPPER"
     printf 'tvboxctl: missing executable: %s\n' "$MARIOKART64_WRAPPER" >&2
+    "$STATECTL" fail "wrapper-missing" >/dev/null 2>&1 || true
+    recover_transition_failure "mariokart64-wrapper-missing"
     return 1
   fi
 
   log "launch mariokart64: starting $MARIOKART64_WRAPPER"
   start_bg "$MARIOKART64_WRAPPER"
 
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 0.5
-    if mariokart64_running; then
-      set_context "mariokart64"
-      exit 0
-    fi
-  done
-
-  log "launch mariokart64: start requested but no mupen64plus process detected"
-  set_context "mariokart64"
+  "$STATECTL" reconcile mariokart64 --wait 12
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$rc" -eq 2 ]; then
+    log "launch mariokart64: content-loading; no reliable ready signal"
+    # Preserve the existing lifecycle behavior; this is not reconciler policy.
+    set_input_profile "mariokart_n64"
+    return 0
+  fi
+  log "launch mariokart64: failed before content loading; returning to Kodi"
+  recover_transition_failure "mariokart64-launch-failure"
 }
 
 evict_preserved() {

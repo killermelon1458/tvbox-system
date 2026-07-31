@@ -6,6 +6,7 @@ After=default.target
 Type=simple
 Environment=HOME=/home/tvbox
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=TVBOX_RUNTIME_ROOT=%t/tvbox
 Environment=WAYLAND_DISPLAY=wayland-0
 Environment=TVBOX_FOCUS_DEBOUNCE_SECONDS=1.0
 Environment=TVBOX_FOCUS_RETRY_SECONDS=1.0

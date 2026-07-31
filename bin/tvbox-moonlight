@@ -4,16 +4,16 @@ set -u
 HOST="192.168.1.189"
 TARGET="${1:-moonlight}"
 LOG="/home/tvbox/.cache/tvbox-moonlight.log"
-STATE_DIR="/tmp/tvbox-moonlight"
-LAST_TARGET_FILE="$STATE_DIR/last-target"
-SUPPRESS_KODI_RETURN="/tmp/tvbox-suppress-kodi-return"
-
-mkdir -p /home/tvbox/.cache "$STATE_DIR"
-
 export HOME=/home/tvbox
 export USER=tvbox
 export LOGNAME=tvbox
-export XDG_RUNTIME_DIR=/run/user/1000
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+RUNTIME_ROOT="${TVBOX_RUNTIME_ROOT:-$XDG_RUNTIME_DIR/tvbox}"
+STATE_DIR="$RUNTIME_ROOT/moonlight"
+LAST_TARGET_FILE="$STATE_DIR/last-target"
+SUPPRESS_KODI_RETURN="$RUNTIME_ROOT/suppress-kodi-return"
+mkdir -p /home/tvbox/.cache "$STATE_DIR"
+chmod 700 "$RUNTIME_ROOT" "$STATE_DIR" 2>/dev/null || true
 export DISPLAY="${DISPLAY:-:0}"
 
 if [ -z "${WAYLAND_DISPLAY:-}" ]; then
@@ -58,11 +58,18 @@ cleanup_return_to_kodi() {
   fi
 
   log "Moonlight wrapper cleanup: returning to Kodi."
+  if /usr/local/bin/tvbox-state is-stable kodi >/dev/null 2>&1; then
+    return 0
+  fi
+  /usr/local/bin/tvbox-state ensure-request kodi >/dev/null 2>&1 || true
+  /usr/local/bin/tvbox-state phase returning --application kodi >/dev/null 2>&1 || true
 
   # Prevent duplicate/stale Kodi instances.
   stop_kodi_cleanly
 
   /usr/local/bin/tvbox-kodi >> "$LOG" 2>&1 &
+  /usr/local/bin/tvbox-state reconcile kodi --returning --wait 15 >> "$LOG" 2>&1 || \
+    /usr/local/bin/tvbox-state fail moonlight-kodi-return-failed >/dev/null 2>&1 || true
 }
 
 trap cleanup_return_to_kodi EXIT
@@ -71,6 +78,8 @@ log "==== tvbox-moonlight target=$TARGET ===="
 log "HOST=$HOST DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
 
 /usr/local/bin/tvbox-inputctl set-profile passthrough >> "$LOG" 2>&1 || true
+/usr/local/bin/tvbox-state ensure-request moonlight "$TARGET" >/dev/null 2>&1 || true
+/usr/local/bin/tvbox-state phase client-starting --application moonlight >/dev/null 2>&1 || true
 
 case "$TARGET" in
   steam)
@@ -106,8 +115,11 @@ esac
 # Close Kodi before Moonlight takes over.
 stop_kodi_cleanly
 
-# Close YouTube Chromium mode if present.
-pkill -TERM -f "chromium.*chromium-tvbox-youtube" 2>/dev/null || true
+# Close only exact Chromium processes using the dedicated YouTube profile.
+while read -r youtube_pid; do
+  [ -n "$youtube_pid" ] || continue
+  kill -TERM "$youtube_pid" 2>/dev/null || true
+done < <(/usr/local/bin/tvbox-state pids youtube 2>/dev/null)
 
 sleep 2
 
@@ -126,12 +138,23 @@ fi
 if [ -n "$APP" ]; then
   echo "$TARGET" > "$LAST_TARGET_FILE"
   log "Launching direct Moonlight app: $APP"
-  moonlight-qt stream "$HOST" "$APP" >> "$LOG" 2>&1
+  /usr/local/bin/tvbox-state phase stream-connecting --application moonlight >/dev/null 2>&1 || true
+  moonlight-qt stream "$HOST" "$APP" >> "$LOG" 2>&1 &
 else
   log "Launching Moonlight GUI"
-  moonlight-qt >> "$LOG" 2>&1
+  /usr/local/bin/tvbox-state phase menu-loading --application moonlight >/dev/null 2>&1 || true
+  moonlight-qt >> "$LOG" 2>&1 &
 fi
 
+client_pid=$!
+/usr/local/bin/tvbox-state attach-pid "$client_pid" >/dev/null 2>&1 || true
+if [ -n "$APP" ]; then
+  /usr/local/bin/tvbox-state observe moonlight >/dev/null 2>&1 || true
+else
+  /usr/local/bin/tvbox-state reconcile moonlight --wait 15 >> "$LOG" 2>&1 || true
+fi
+wait "$client_pid"
 CODE=$?
 log "Moonlight exited with code $CODE"
+/usr/local/bin/tvbox-state client-exit moonlight "$CODE" >/dev/null 2>&1 || true
 exit "$CODE"

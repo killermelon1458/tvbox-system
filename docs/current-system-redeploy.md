@@ -82,6 +82,7 @@ The important live commands after install are:
 
 ```text
 /usr/local/bin/tvboxctl
+/usr/local/bin/tvbox-state
 /usr/local/bin/tvbox-home
 /usr/local/bin/tvbox-exit
 /usr/local/bin/tvbox-kodi
@@ -98,6 +99,24 @@ The important live commands after install are:
 ```
 
 `tvbox-home` is the global F12 target. It handles the current emergency Mupen64Plus exit path first, then delegates to `tvboxctl home`.
+
+`tvbox-state` owns boot-local lifecycle observation and reconciliation below
+`$XDG_RUNTIME_DIR/tvbox` (or `TVBOX_RUNTIME_ROOT` for tests). It keeps
+`lifecycle-request.json`, `transition-state.json`, `observed-state.json`,
+`stable-state.json`, and `failure-state.json` distinct. Files are schema
+versioned, boot-ID checked, mode 0600, and atomically replaced. The compatibility
+`active-context` file mirrors stable accepted state only.
+
+Kodi is accepted only with an exact Kodi process and Kodi Wayland toplevel and
+no conflicting controlled-app toplevel. Moonlight and Steam Link menus require
+their exact process plus matching toplevel and a short stability interval.
+YouTube requires the dedicated Chromium profile plus matching toplevel and is
+reported as medium-confidence browser-window readiness. Mario Kart remains
+`content-loading`; process/splash does not claim game readiness.
+
+Home records `returning` before local close, invokes the canonical Kodi wrapper,
+and commits Kodi only after its readiness predicate. One bounded retry is made.
+Moonlight Home remains local and non-destructive.
 
 `tvbox-exit` is the global F5 target. It delegates to `tvboxctl exit`, which closes the current TVBox mode. In Kodi, Exit only opens Favourites when Kodi is not already at Favourites. If Kodi is already at Favourites, Exit closes Kodi to the desktop. Five repeated Exit presses run exit panic recovery: close TVBox-controlled apps, close Kodi, and leave the desktop. Five repeated Home presses run home panic recovery: clean up local foreground apps, hard-restart Kodi, and return to Favourites.
 
@@ -119,6 +138,12 @@ Steam Link -> passthrough
 Moonlight -> passthrough
 Mario Kart 64 -> mariokart_n64
 ```
+
+These profile choices remain existing configurable lifecycle behavior in
+`tvboxctl` and the wrappers. `tvbox-state` only observes the profile, its source
+and change time; it does not map application phases to profiles. Transition
+failure recovery defaults to `restore-kodi-after-kodi-ready` and can be disabled
+with `INPUT_RECOVERY_ON_TRANSITION_FAILURE=none`.
 
 ## Passive Diagnostics (Installed, Not Automatically Enabled)
 

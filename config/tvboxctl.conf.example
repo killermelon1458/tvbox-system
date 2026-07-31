@@ -3,7 +3,9 @@
 TVBOX_USER="tvbox"
 TVBOX_UID="1000"
 
-STATE_DIR="/run/user/1000/tvbox"
+# Runtime state is boot-local. Tests may set TVBOX_RUNTIME_ROOT.
+# Production derives this as $XDG_RUNTIME_DIR/tvbox.
+STATE_DIR=""
 FALLBACK_STATE_DIR="/tmp/tvbox"
 LOG_DIR="/home/tvbox/.cache"
 
@@ -19,6 +21,12 @@ SPOTIFY_USER_SERVICE="tvbox-spotify-mode.service"
 MOONLIGHT_STOP_SOFT="/usr/local/bin/tvbox-stop-moonlight"
 MOONLIGHT_STOP_HARD="/usr/local/bin/tvbox-quit-moonlight-session"
 MOONLIGHT_HOST="192.168.1.189"
+STATECTL="/usr/local/bin/tvbox-state"
+
+# Existing lifecycle code still selects profiles. The state reconciler only
+# observes them and never defines a phase-to-profile policy.
+INPUT_RECOVERY_PRESERVE_EXISTING_BEHAVIOR=1
+INPUT_RECOVERY_ON_TRANSITION_FAILURE="restore-kodi-after-kodi-ready"
 
 MAX_PRESERVED_APPS=0
 EXIT_CLOSES_KODI=0

@@ -3,7 +3,7 @@ set -u
 
 TVBOX_USER="${TVBOX_USER:-tvbox}"
 TVBOX_UID="${TVBOX_UID:-1000}"
-STATE_DIR="${TVBOX_INPUTCTL_STATE_DIR:-/run/user/$TVBOX_UID/tvbox}"
+STATE_DIR="${TVBOX_INPUTCTL_STATE_DIR:-${TVBOX_RUNTIME_ROOT:-${XDG_RUNTIME_DIR:-/run/user/$TVBOX_UID}/tvbox}}"
 FALLBACK_STATE_DIR="${TVBOX_INPUTCTL_FALLBACK_STATE_DIR:-/tmp/tvbox}"
 LOG_DIR="${TVBOX_INPUTCTL_LOG_DIR:-/home/tvbox/.cache}"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")"
@@ -21,6 +21,7 @@ if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
   STATE_DIR="$FALLBACK_STATE_DIR"
   mkdir -p "$STATE_DIR"
 fi
+chmod 700 "$STATE_DIR" 2>/dev/null || true
 
 mkdir -p "$LOG_DIR"
 
