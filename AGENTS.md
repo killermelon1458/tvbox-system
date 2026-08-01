@@ -54,6 +54,71 @@ Do not mix speculative plans into current-state documentation. Speculative or un
 
 Untracked speculative plan docs may remain untracked unless the user explicitly asks to track them. Project documentation that describes current behavior or validated workflow should be tracked.
 
+## Obsidian / Syncthing Handoff Copies
+
+The repository remains the canonical source of truth. The Obsidian/Syncthing tree is a duplicate for reading and handoff only; never edit the mirror instead of the repository copy.
+
+Use this project handoff root:
+
+```text
+/home/tvbox/Documents/Notes/Notes/Codex/tvbox/tvbox/
+```
+
+Create the handoff root and any required subdirectories with `mkdir -p` as needed. Missing directories are not an error and do not require the user to create them first.
+
+### Documentation mirror
+
+Whenever a task creates or updates a repository documentation file, copy the final repository version into the handoff tree before the final response.
+
+Preserve the file's path relative to `/opt/tvbox-system`. Examples:
+
+```text
+/opt/tvbox-system/docs/current-system-redeploy.md
+-> /home/tvbox/Documents/Notes/Notes/Codex/tvbox/tvbox/docs/current-system-redeploy.md
+
+/opt/tvbox-system/docs/development/2026-07-31-example.md
+-> /home/tvbox/Documents/Notes/Notes/Codex/tvbox/tvbox/docs/development/2026-07-31-example.md
+```
+
+Apply these rules:
+
+- Copy documentation files; do not move them and do not replace them with symlinks.
+- Mirror every documentation file created or modified by the task, including documentation outside `docs/` when applicable.
+- Keep the mirrored content identical to the final canonical repository file.
+- The mirrored filename must end in `.md` so Obsidian renders it. If the canonical documentation file has another extension, replace only the mirrored copy's final extension with `.md`. Do not rename the canonical file solely for the mirror.
+- Create parent directories before copying.
+- Overwrite an older mirrored copy of the same canonical document so the mirror reflects the latest final version.
+- Do not copy secrets, credentials, runtime data, logs, caches, or other prohibited material into the handoff tree.
+- Verify each required mirrored file exists. When content is copied without conversion, verify it with `cmp -s` or an equivalent check.
+
+### Final-response transcripts
+
+Before sending every final user-facing response, save an exact Markdown copy of that response under:
+
+```text
+/home/tvbox/Documents/Notes/Notes/Codex/tvbox/tvbox/transcripts/YYYY-MM-DD/
+```
+
+Use a timestamped, descriptive filename:
+
+```text
+YYYY-MM-DD_HH-MM-SS-short-topic.md
+```
+
+If that filename already exists, append a numeric suffix rather than overwriting a prior transcript.
+
+The transcript file must:
+
+- contain the complete verbatim final response in Markdown, including the full transcript path reported to the user;
+- include all reported file changes, validation results, limitations, and recommended commit message that appear in the final response;
+- exclude secrets and credential values;
+- be written before the response is returned;
+- be mentioned in the final response by its full path.
+
+Transcript creation is required even when the task is planning-only, discovery-only, documentation-only, makes no repository changes, or ends without implementation. Do not create transcripts for intermediate tool output or internal reasoning; create one transcript for each completed final response.
+
+Failure to write a mirror or transcript does not authorize changing repository content or live system state to compensate. Report the failure and its cause in the final response.
+
 ## Required Workflow
 
 Before editing, run:

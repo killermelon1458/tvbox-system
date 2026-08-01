@@ -16,6 +16,13 @@ if ! id "$TVBOX_USER" >/dev/null 2>&1; then
   exit 1
 fi
 
+if getent group input >/dev/null 2>&1 \
+    && ! id -nG "$TVBOX_USER" | tr ' ' '\n' | grep -qx input; then
+  usermod -a -G input "$TVBOX_USER"
+  echo "Added $TVBOX_USER to input group for passive activity observation."
+  echo "A new login session is required before that group is available."
+fi
+
 screensaver_packages=(
   gir1.2-gtk-3.0
   gir1.2-gtklayershell-0.1
@@ -130,6 +137,66 @@ if [ ! -f "$screensaver_config" ]; then
 else
   echo "Keeping existing user screensaver configuration."
 fi
+if ! grep -q '^\[screensaver\.automatic\]$' "$screensaver_config"; then
+  screensaver_backup="${screensaver_config}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -a "$screensaver_config" "$screensaver_backup"
+  {
+    echo
+    echo '[screensaver.automatic]'
+    echo 'enabled = true'
+    echo 'idle_state_stale_seconds = 5'
+    echo 'reconcile_interval_seconds = 1'
+    echo 'suppress_after_manual_stop = "until-next-idle-epoch"'
+  } >> "$screensaver_config"
+  chown "$TVBOX_USER:$TVBOX_USER" "$screensaver_config"
+  chmod 0644 "$screensaver_config"
+  echo "Added automatic idle policy; backup: $screensaver_backup"
+fi
+
+echo
+echo "Installing canonical idle-state configuration..."
+idle_config="$TVBOX_HOME/.config/tvbox/idle.toml"
+if [ ! -f "$idle_config" ]; then
+  install_file "$REPO_DIR/config/idle.toml" \
+    "$idle_config" 0644 "$TVBOX_USER:$TVBOX_USER"
+  echo "Installed user idle-state configuration."
+else
+  echo "Keeping existing user idle-state configuration."
+fi
+idle_candidate="$(mktemp)"
+awk '
+  BEGIN { in_kodi = 0; found = 0 }
+  /^\[providers\.kodi\]$/ {
+    found = 1
+    in_kodi = 1
+    print "[providers.kodi]"
+    print "enabled = true"
+    print "timeout_seconds = 600"
+    print "required_sources = [\"flirc\", \"keyboard\", \"pointer\"]"
+    print "observer_stale_seconds = 5"
+    next
+  }
+  in_kodi && /^\[/ { in_kodi = 0 }
+  !in_kodi { print }
+  END {
+    if (!found) {
+      print ""
+      print "[providers.kodi]"
+      print "enabled = true"
+      print "timeout_seconds = 600"
+      print "required_sources = [\"flirc\", \"keyboard\", \"pointer\"]"
+      print "observer_stale_seconds = 5"
+    }
+  }
+' "$idle_config" > "$idle_candidate"
+if ! cmp -s "$idle_candidate" "$idle_config"; then
+  idle_backup="${idle_config}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -a "$idle_config" "$idle_backup"
+  install -m 0644 -o "$TVBOX_USER" -g "$TVBOX_USER" \
+    "$idle_candidate" "$idle_config"
+  echo "Enabled the safe Kodi idle provider; backup: $idle_backup"
+fi
+rm -f "$idle_candidate"
 
 echo
 echo "Installing labwc config..."
@@ -157,6 +224,19 @@ if [ -d "$REPO_DIR/config/systemd-user" ]; then
     install_file "$unit" "$unit_dst" 0644 "$TVBOX_USER:$TVBOX_USER"
   done
 fi
+user_wants="$TVBOX_HOME/.config/systemd/user/default.target.wants"
+install -d -m 0755 -o "$TVBOX_USER" -g "$TVBOX_USER" "$user_wants"
+for unit_name in tvbox-overlay.service tvbox-screensaver-policy.service \
+                 tvbox-activityd.service tvbox-idled.service \
+                 tvbox-kodi-observer.service; do
+  unit_path="$TVBOX_HOME/.config/systemd/user/$unit_name"
+  wants_path="$user_wants/$unit_name"
+  if [ -f "$unit_path" ] && [ ! -e "$wants_path" ] && [ ! -L "$wants_path" ]; then
+    ln -s "$unit_path" "$wants_path"
+    chown -h "$TVBOX_USER:$TVBOX_USER" "$wants_path"
+    echo "Enabled user unit for next login: $unit_name"
+  fi
+done
 
 echo
 echo "Installing systemd drop-ins..."

@@ -527,6 +527,8 @@ def dump_status():
         "failure": read_state("failure-state.json"),
         "overlay": read_state("overlay-state.json"),
         "screensaver_policy": read_state("screensaver-policy.json"),
+        "activity": read_state("activity-state.json"),
+        "idle": read_state("idle-state.json"),
     }
     print(json.dumps(value, indent=2, sort_keys=True))
 

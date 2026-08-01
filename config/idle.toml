@@ -1,0 +1,52 @@
+[global]
+enabled = true
+stability_delay_seconds = 3.0
+poll_interval_seconds = 0.25
+display_status_path = "/sys/class/drm/card1-HDMI-A-2/status"
+
+[activity]
+pointer_distance_px = 12
+pointer_window_ms = 500
+device_rescan_seconds = 2.0
+activity_stale_seconds = 5.0
+exclude_virtual_device_names = [
+  "antimicrox Keyboard Emulation",
+  "antimicrox Mouse Emulation",
+  "antimicrox Abs Mouse Emulation",
+]
+exclude_controller_hid = true
+
+[providers.desktop]
+enabled = true
+timeout_seconds = 300
+required_sources = ["keyboard", "pointer"]
+
+[providers.kodi]
+enabled = true
+timeout_seconds = 600
+required_sources = ["flirc", "keyboard", "pointer"]
+observer_stale_seconds = 5
+
+[providers.spotify]
+enabled = false
+timeout_seconds = 120
+
+[providers.youtube]
+enabled = false
+timeout_seconds = 300
+
+[providers.moonlight]
+enabled = false
+timeout_seconds = 300
+
+[providers.steamlink]
+enabled = false
+timeout_seconds = 300
+
+[providers.mariokart64]
+enabled = false
+timeout_seconds = 300
+
+[providers.unknown]
+enabled = false
+timeout_seconds = 300

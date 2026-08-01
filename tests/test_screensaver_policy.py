@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).parents[1] / "lib"))
 
 from tvbox.screensaver.policy import ScreensaverPolicy
+from tvbox.screensaver.idle_watch import IdleStateWatcher
 
 
 CONFIG = """
@@ -37,11 +39,14 @@ class FakePolicy(ScreensaverPolicy):
         self.fake_requests = {}
         self.fake_active = None
         self.next_generation = 0
+        self.request_messages = []
+        self.release_messages = []
         super().__init__(*args, **kwargs)
 
     def overlay(self, message):
         command = message["command"]
         if command == "request":
+            self.request_messages.append(message.copy())
             self.next_generation += 1
             token = f"{self.next_generation:032x}"
             item = {
@@ -62,6 +67,7 @@ class FakePolicy(ScreensaverPolicy):
                 "requests": list(self.fake_requests.values()),
             }}
         if command == "release":
+            self.release_messages.append(message.copy())
             if message["request_id"] not in self.fake_requests:
                 return {"ok": False, "error": "stale"}
             self.fake_requests.pop(message["request_id"])
@@ -91,6 +97,24 @@ class PolicyTests(unittest.TestCase):
     def tearDown(self):
         self.env.stop()
         self.tmp.cleanup()
+
+    def write_idle(self, state="idle", idle=True, epoch=10.0,
+                   boot="test-boot", schema=1, age=0.0,
+                   health=None, writer="idle-writer"):
+        value = {
+            "schema_version": schema, "boot_id": boot,
+            "writer_instance_id": writer, "provider": "desktop",
+            "epoch_started_monotonic": epoch,
+            "updated_monotonic": time.monotonic() - age,
+            "state": state, "idle": idle, "confidence": "high",
+            "source_health": health or {
+                "activity": "healthy", "application_state": "healthy",
+                "provider": "healthy",
+            },
+        }
+        (self.root / "idle-state.json").write_text(
+            __import__("json").dumps(value))
+        return value
 
     def test_manual_start_and_exact_stop(self):
         status = self.policy.start()
@@ -185,6 +209,166 @@ class PolicyTests(unittest.TestCase):
             self.policy.tick()
         self.assertEqual(self.policy.active_token, old)
         self.assertEqual(self.policy.last_error, "replacement failed")
+
+    def test_valid_idle_starts_exactly_one_automatic_request(self):
+        self.write_idle()
+        self.policy.tick()
+        token = self.policy.active_token
+        self.assertEqual(self.policy.activation_source, "automatic")
+        self.assertEqual(len(self.policy.request_messages), 1)
+        self.policy.tick()
+        self.assertEqual(self.policy.active_token, token)
+        self.assertEqual(len(self.policy.request_messages), 1)
+
+    def test_nonidle_and_fail_safe_states_never_activate(self):
+        cases = (
+            ("active", False), ("idle-pending", False),
+            ("inhibited", False), ("degraded", False),
+            ("unknown", False), ("display-absent", False),
+            ("recovering", False),
+        )
+        for state, idle in cases:
+            with self.subTest(state=state):
+                self.write_idle(state=state, idle=idle)
+                self.policy.tick()
+                self.assertIsNone(self.policy.active_token)
+        self.assertEqual(len(self.policy.request_messages), 0)
+
+    def test_invalid_idle_records_fail_safe_and_release_automatic(self):
+        self.write_idle()
+        self.policy.tick()
+        token = self.policy.active_token
+        invalid_writers = (
+            lambda: (self.root / "idle-state.json").unlink(),
+            lambda: (self.root / "idle-state.json").write_text("{"),
+            lambda: self.write_idle(schema=99),
+            lambda: self.write_idle(boot="old-boot"),
+            lambda: self.write_idle(age=10),
+            lambda: self.write_idle(health={
+                "activity": "degraded", "application_state": "healthy",
+                "provider": "healthy"}),
+        )
+        for index, make_invalid in enumerate(invalid_writers):
+            with self.subTest(index=index):
+                if not self.policy.active_token:
+                    self.write_idle(epoch=20.0 + index)
+                    self.policy.tick()
+                make_invalid()
+                released = self.policy.active_token
+                self.policy.tick()
+                self.assertIsNone(self.policy.active_token)
+                self.assertIn(released, [item["request_id"]
+                                         for item in self.policy.release_messages])
+        self.assertIsNotNone(token)
+
+    def test_manual_stop_suppresses_same_epoch_then_new_epoch_activates(self):
+        self.write_idle(epoch=10)
+        self.policy.tick()
+        self.policy.stop()
+        self.assertIsNone(self.policy.active_token)
+        self.policy.tick()
+        self.assertIsNone(self.policy.active_token)
+        self.assertEqual(self.policy.suppressed_idle_epoch["epoch_started_monotonic"], 10)
+        self.write_idle(state="active", idle=False, epoch=10)
+        self.policy.tick()
+        self.assertIsNone(self.policy.suppressed_idle_epoch)
+        self.write_idle(epoch=11)
+        self.policy.tick()
+        self.assertEqual(self.policy.activation_source, "automatic")
+        self.assertIsNotNone(self.policy.active_token)
+
+    def test_suppression_survives_restart_and_manual_start_overrides(self):
+        self.write_idle(epoch=30)
+        self.policy.tick()
+        self.policy.stop()
+        restarted = FakePolicy(
+            self.config, root=self.root, now=lambda: self.current)
+        self.assertIsNone(restarted.active_token)
+        self.assertEqual(restarted.activation_source, "inactive")
+        restarted.start()
+        self.assertEqual(restarted.activation_source, "manual")
+        self.assertIsNone(restarted.suppressed_idle_epoch)
+
+    def test_manual_request_is_independent_of_canonical_idle(self):
+        self.policy.start()
+        token = self.policy.active_token
+        self.write_idle(state="active", idle=False)
+        self.policy.tick()
+        self.assertEqual(self.policy.active_token, token)
+        self.assertEqual(self.policy.activation_source, "manual")
+
+    def test_automatic_schedule_switch_preserves_idle_epoch(self):
+        self.write_idle(epoch=40)
+        self.policy.tick()
+        epoch = self.policy.automatic_idle_epoch.copy()
+        old = self.policy.active_token
+        self.current = datetime(2026, 7, 16, 0, 0, tzinfo=self.zone)
+        self.policy.tick()
+        self.assertEqual(self.policy.active_mode, "black")
+        self.assertNotEqual(self.policy.active_token, old)
+        self.assertEqual(self.policy.automatic_idle_epoch, epoch)
+        self.assertEqual(len(self.policy.request_messages), 2)
+
+    def test_lost_automatic_request_is_recreated_while_idle(self):
+        self.write_idle(epoch=50)
+        self.policy.tick()
+        old = self.policy.active_token
+        self.policy.fake_requests.clear()
+        self.policy.fake_active = None
+        self.policy.tick()
+        self.assertNotEqual(self.policy.active_token, old)
+        self.assertEqual(self.policy.activation_source, "automatic")
+
+    def test_failed_renderer_retry_is_bounded(self):
+        self.write_idle(epoch=55)
+        self.policy.tick()
+        token = self.policy.active_token
+        self.policy.fake_requests[token]["state"] = "failed"
+        self.policy.fake_requests[token]["failure_reason"] = "startup-failed"
+        self.policy.fake_active = None
+        self.policy.tick()
+        self.assertIsNone(self.policy.active_token)
+        self.assertEqual(len(self.policy.request_messages), 1)
+        self.policy.tick()
+        self.assertEqual(len(self.policy.request_messages), 1)
+        self.assertEqual(self.policy.last_error, "startup-failed")
+
+    def test_status_separates_idle_policy_and_overlay(self):
+        self.write_idle(epoch=60)
+        self.policy.tick()
+        status = self.policy.status()
+        self.assertEqual(status["idle_input"]["health"], "healthy")
+        self.assertTrue(status["automatic"]["eligible"])
+        self.assertEqual(status["activation_source"], "automatic")
+        self.assertEqual(status["overlay_active"]["renderer"], "slideshow")
+
+    def test_directory_watcher_observes_atomic_idle_replacement(self):
+        watcher = IdleStateWatcher(self.root)
+        try:
+            temporary = self.root / ".idle-state.json.tmp"
+            temporary.write_text("{}")
+            temporary.replace(self.root / "idle-state.json")
+            deadline = time.monotonic() + 1
+            matched = False
+            while time.monotonic() < deadline and not matched:
+                matched = watcher.changed()
+                time.sleep(0.01)
+            self.assertTrue(matched)
+        finally:
+            watcher.close()
+
+    def test_architectural_boundaries_remain_observation_action_split(self):
+        root = Path(__file__).parents[1]
+        idled = (root / "bin/tvbox-idled").read_text()
+        engine = (root / "lib/tvbox/idle/engine.py").read_text()
+        policy = (root / "lib/tvbox/screensaver/policy.py").read_text()
+        for forbidden in ("tvbox-overlay", "tvbox-screensaver",
+                          '"command": "request"'):
+            self.assertNotIn(forbidden, idled + engine)
+        self.assertNotIn("tvbox.idle.providers", policy)
+        for forbidden in ("tvbox-inputctl", "active-context",
+                          "stable-state.json", "activity-state.json"):
+            self.assertNotIn(forbidden, policy)
 
 
 if __name__ == "__main__":

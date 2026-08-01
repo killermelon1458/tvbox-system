@@ -7,6 +7,10 @@
 > `docs/tvbox-screensaver-overlay-scheduling-implementation-plan.md`. Do not use
 > this document as the implementation contract for the overlay manager,
 > renderers, manual screensaver, or scheduling.
+>
+> Automatic idle determination is now governed by the narrower canonical plan
+> `docs/tvbox-canonical-idle-state-engine-plan.md`. Provider/action coupling in
+> this historical document is not the deployed idle-state contract.
 
 ## 1. Purpose
 

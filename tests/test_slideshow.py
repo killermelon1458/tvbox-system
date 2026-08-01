@@ -110,6 +110,64 @@ class SlideshowTests(unittest.TestCase):
         self.assertEqual(scan_images(self.root / "missing", True,
                                      DEFAULT_EXTENSIONS, 10), [])
 
+    def test_root_and_multiple_nesting_levels_are_one_collection(self):
+        paths = (
+            self.root / "photo1.jpg",
+            self.root / "Family" / "photo2.jpg",
+            self.root / "Family" / "Vacations" / "photo3.png",
+            self.root / "Pets" / "photo4.webp",
+        )
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"candidate")
+        found = scan_images(self.root, True, DEFAULT_EXTENSIONS, 100)
+        self.assertEqual({item.path.relative_to(self.root) for item in found},
+                         {path.relative_to(self.root) for path in paths})
+
+    def test_directory_symlinks_are_not_followed_and_hardlinks_deduplicate(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        original = nested / "original.jpg"
+        original.write_bytes(b"candidate")
+        os.link(original, self.root / "duplicate.jpg")
+        (self.root / "nested-link").symlink_to(nested, target_is_directory=True)
+        (nested / "loop").symlink_to(self.root, target_is_directory=True)
+        found = scan_images(self.root, True, DEFAULT_EXTENSIONS, 100)
+        self.assertEqual(len(found), 1)
+        self.assertIn(found[0].path.name, {"duplicate.jpg", "original.jpg"})
+
+    def test_inaccessible_subdirectory_is_logged_and_siblings_continue(self):
+        blocked = self.root / "blocked"
+        blocked.mkdir()
+        good = self.root / "good" / "photo.jpg"
+        good.parent.mkdir()
+        good.write_bytes(b"candidate")
+        real_scandir = os.scandir
+
+        def selective_scandir(path):
+            if Path(path) == blocked:
+                raise PermissionError("test denied")
+            return real_scandir(path)
+
+        logger = mock.Mock()
+        with mock.patch("tvbox.screensaver.slideshow.os.scandir",
+                        side_effect=selective_scandir):
+            found = scan_images(self.root, True, DEFAULT_EXTENSIONS, 100,
+                                logger=logger)
+        self.assertEqual([item.path for item in found], [good])
+        logger.warning.assert_called_once()
+        self.assertIn(str(blocked), logger.warning.call_args.args)
+
+    def test_recursive_tree_with_only_hidden_and_unsupported_is_empty(self):
+        hidden = self.root / ".hidden" / "photo.jpg"
+        hidden.parent.mkdir()
+        hidden.write_bytes(b"candidate")
+        unsupported = self.root / "nested" / "clip.mp4"
+        unsupported.parent.mkdir()
+        unsupported.write_bytes(b"video")
+        self.assertEqual(scan_images(
+            self.root, True, DEFAULT_EXTENSIONS, 100), [])
+
     def test_zero_byte_oversize_and_removed_candidate(self):
         zero = self.root / "zero.jpg"
         zero.touch()
@@ -233,9 +291,10 @@ class SlideshowTests(unittest.TestCase):
         for contract in (
             "ThreadPoolExecutor", "max_workers=1", "self._rescan",
             "self.scaled = None", "_draw_black", "no-valid-images-black-fallback",
-            "report_after_first_paint",
+            "report_after_first_paint", "self.args.image_directory, True",
         ):
             self.assertIn(contract, source)
+        self.assertLess(source.index("self.logger ="), source.index("self._rescan()"))
 
 
 if __name__ == "__main__":

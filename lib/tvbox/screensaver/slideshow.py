@@ -22,6 +22,7 @@ class ImageCandidate:
     size: int
     mtime_ns: int
     inode: int
+    device: int
 
     @property
     def fingerprint(self):
@@ -79,45 +80,69 @@ def candidate_for_path(path, extensions, max_file_bytes=256 * 1024 * 1024):
         return None
     if info.st_size > max_file_bytes:
         return None
-    return ImageCandidate(path, info.st_size, info.st_mtime_ns, info.st_ino)
+    return ImageCandidate(
+        path, info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev)
 
 
 def scan_images(directory, recursive, extensions, max_files,
-                max_file_bytes=256 * 1024 * 1024):
+                max_file_bytes=256 * 1024 * 1024, logger=None):
+    logger = logger or logging.getLogger("tvbox.slideshow")
     root = Path(directory)
     try:
-        if not root.is_dir():
+        root_info = root.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(root_info.st_mode):
             return []
-    except OSError:
+    except (FileNotFoundError, PermissionError, OSError):
         return []
     result = []
+    seen_files = set()
+    seen_directories = {(root_info.st_dev, root_info.st_ino)}
+    pending = [(root, True)]
 
-    def visit(folder):
-        try:
-            entries = sorted(os.scandir(folder), key=lambda item: item.name.lower())
-        except (FileNotFoundError, PermissionError, OSError):
-            return
-        for entry in entries:
-            if len(result) >= max_files:
-                return
-            name = entry.name
-            if name.startswith(".") or _is_syncthing_temp(name):
-                continue
+    while pending and len(result) < max_files:
+        path, is_directory = pending.pop()
+        name = path.name
+        if is_directory:
             try:
-                if entry.is_dir(follow_symlinks=False):
-                    if recursive and name.lower() not in IGNORED_DIRECTORIES:
-                        visit(Path(entry.path))
-                    continue
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-            except OSError:
+                entries = sorted(os.scandir(path),
+                                 key=lambda item: item.name.lower())
+            except (FileNotFoundError, PermissionError, OSError) as exc:
+                logger.warning("slideshow directory skipped path=%r reason=%s",
+                               str(path), exc)
                 continue
-            candidate = candidate_for_path(
-                Path(entry.path), extensions, max_file_bytes=max_file_bytes)
-            if candidate:
-                result.append(candidate)
+            children = []
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") or _is_syncthing_temp(name):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if recursive and name.lower() not in IGNORED_DIRECTORIES:
+                            info = entry.stat(follow_symlinks=False)
+                            identity = (info.st_dev, info.st_ino)
+                            if identity not in seen_directories:
+                                seen_directories.add(identity)
+                                children.append((Path(entry.path), True))
+                        continue
+                    if entry.is_file(follow_symlinks=False):
+                        children.append((Path(entry.path), False))
+                except OSError:
+                    continue
+            # A LIFO worklist processes the sorted entries in their original
+            # depth-first order without Python call-stack recursion.
+            pending.extend(reversed(children))
+            continue
 
-    visit(root)
+        if name.startswith(".") or _is_syncthing_temp(name):
+            continue
+        candidate = candidate_for_path(
+            path, extensions, max_file_bytes=max_file_bytes)
+        if candidate:
+            identity = (candidate.device, candidate.inode)
+            if identity in seen_files:
+                continue
+            seen_files.add(identity)
+            result.append(candidate)
     return result
 
 

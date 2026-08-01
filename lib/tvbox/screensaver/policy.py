@@ -9,7 +9,7 @@ import threading
 import time
 import sys
 
-from tvbox.runtime import instance_id, read_json, runtime_root, write_json
+from tvbox.runtime import boot_id, instance_id, read_json, runtime_root, write_json
 from tvbox.screensaver.schedule import load_config, next_boundary, scheduled_mode
 
 
@@ -44,13 +44,120 @@ class ScreensaverPolicy:
         self.active_token = previous.get("active_request_id")
         self.active_generation = previous.get("active_generation")
         self.active_mode = previous.get("active_mode")
+        saved_source = previous.get("activation_source")
+        if saved_source not in {"manual", "automatic"}:
+            saved_source = "manual" if self.active_requested else "inactive"
+        self.activation_source = saved_source
+        previous_automatic = previous.get("automatic") or {}
+        self.automatic_idle_epoch = previous_automatic.get("idle_epoch")
+        self.suppressed_idle_epoch = previous_automatic.get(
+            "suppressed_idle_epoch")
+        self.idle_input = {}
         self.last_error = previous.get("last_error")
         self.lease_seconds = 120.0
         self.last_renewal = 0.0
+        self.retry_not_before = 0.0
         self.overlay_socket = self.root / "overlay.sock"
         self.state_path = self.root / "screensaver-policy.json"
         self.lock = threading.RLock()
+        self.reconcile_idle()
         self.publish()
+
+    @staticmethod
+    def _epoch(record):
+        required = ("boot_id", "writer_instance_id", "provider",
+                    "epoch_started_monotonic")
+        if not all(record.get(key) is not None for key in required):
+            return None
+        return {key: record[key] for key in required}
+
+    def read_idle_input(self):
+        path = self.root / "idle-state.json"
+        result = {
+            "path": str(path), "health": "missing", "eligible": False,
+            "state": "missing", "idle": False, "provider": None,
+            "confidence": None, "epoch": None, "age_seconds": None,
+        }
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return result
+        except (OSError, ValueError, TypeError):
+            result.update(health="malformed", state="unknown")
+            return result
+        if not isinstance(record, dict):
+            result.update(health="malformed", state="unknown")
+            return result
+        result.update(
+            state=record.get("state", "unknown"),
+            idle=record.get("idle") is True,
+            provider=record.get("provider"),
+            confidence=record.get("confidence"),
+            epoch=self._epoch(record),
+        )
+        if record.get("schema_version") != 1:
+            result["health"] = "unsupported-schema"
+            return result
+        if record.get("boot_id") != boot_id():
+            result["health"] = "wrong-boot"
+            return result
+        updated = record.get("updated_monotonic")
+        if not isinstance(updated, (int, float)):
+            result["health"] = "malformed"
+            return result
+        age = max(0.0, self.monotonic() - updated)
+        result["age_seconds"] = age
+        if age > self.config.idle_state_stale_seconds:
+            result["health"] = "stale"
+            return result
+        source_health = record.get("source_health") or {}
+        acceptable_health = (
+            source_health.get("activity") == "healthy"
+            and source_health.get("application_state") == "healthy"
+            and source_health.get("provider") == "healthy"
+        )
+        if record.get("state") != "idle" or record.get("idle") is not True:
+            result["health"] = "non-idle"
+            return result
+        if not acceptable_health:
+            result["health"] = "unacceptable-source-health"
+            return result
+        if result["epoch"] is None:
+            result["health"] = "malformed"
+            return result
+        result["health"] = "healthy"
+        result["eligible"] = bool(self.config.automatic_enabled)
+        if not self.config.automatic_enabled:
+            result["health"] = "automatic-disabled"
+        return result
+
+    def reconcile_idle(self):
+        """Consume canonical idle only; never derive idle independently."""
+        idle_input = self.read_idle_input()
+        self.idle_input = idle_input
+        epoch = idle_input.get("epoch")
+        if epoch and self.suppressed_idle_epoch and (
+                epoch != self.suppressed_idle_epoch):
+            self.suppressed_idle_epoch = None
+        if idle_input.get("health") == "non-idle":
+            self.suppressed_idle_epoch = None
+
+        if not idle_input.get("eligible"):
+            if self.activation_source == "automatic":
+                self._stop(suppress=False)
+            return
+        if self.suppressed_idle_epoch == epoch:
+            return
+        if self.activation_source == "manual" and self.active_requested:
+            return
+        if self.activation_source == "automatic" and self.active_requested:
+            self.automatic_idle_epoch = epoch
+            return
+        try:
+            self._start("automatic", epoch)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.last_error = str(exc)
+            self.retry_not_before = self.monotonic() + 5.0
 
     def schedule_facts(self):
         moment = self.now()
@@ -79,9 +186,13 @@ class ScreensaverPolicy:
     def overlay(self, message):
         return socket_request(self.overlay_socket, message)
 
-    def start(self):
+    def _start(self, source, idle_epoch=None):
         with self.lock:
             self.active_requested = True
+            self.activation_source = source
+            self.automatic_idle_epoch = idle_epoch if source == "automatic" else None
+            if source == "manual":
+                self.suppressed_idle_epoch = None
             _, scheduled, effective, _ = self.schedule_facts()
             if self.active_token:
                 return self.replace_if_needed(effective)
@@ -102,23 +213,42 @@ class ScreensaverPolicy:
             self.active_mode = effective
             self.last_error = None
             self.last_renewal = self.monotonic()
+            self.retry_not_before = 0.0
+            self.publish()
+            return self.status()
+
+    def start(self):
+        return self._start("manual")
+
+    def _stop(self, suppress):
+        with self.lock:
+            if (suppress and self.activation_source == "automatic"
+                    and self.automatic_idle_epoch):
+                self.suppressed_idle_epoch = self.automatic_idle_epoch
+            self.active_requested = False
+            self.activation_source = "inactive"
+            self.automatic_idle_epoch = None
+            if not self.active_token:
+                self.publish()
+                return self.status()
+            token = self.active_token
+            try:
+                response = self.overlay(
+                    {"command": "release", "request_id": token})
+                self.last_error = (
+                    None if response.get("ok") else response.get("error"))
+            except (OSError, RuntimeError, ValueError) as exc:
+                # Relinquish local ownership; the finite exact-token lease is
+                # the fail-safe if the manager is temporarily unavailable.
+                self.last_error = str(exc)
+            self.active_token = None
+            self.active_generation = None
+            self.active_mode = None
             self.publish()
             return self.status()
 
     def stop(self):
-        with self.lock:
-            self.active_requested = False
-            if not self.active_token:
-                return self.status()
-            token = self.active_token
-            response = self.overlay({"command": "release", "request_id": token})
-            if response.get("ok") or response.get("error"):
-                self.active_token = None
-                self.active_generation = None
-                self.active_mode = None
-                self.last_error = None
-            self.publish()
-            return self.status()
+        return self._stop(suppress=True)
 
     def shutdown(self):
         """Release this instance's token without clearing persisted intent."""
@@ -194,6 +324,7 @@ class ScreensaverPolicy:
     def reload(self):
         with self.lock:
             self.config = load_config(self.config_path)
+            self.reconcile_idle()
             effective = self.schedule_facts()[2]
             if self.active_token:
                 self.replace_if_needed(effective)
@@ -202,6 +333,7 @@ class ScreensaverPolicy:
 
     def tick(self):
         with self.lock:
+            self.reconcile_idle()
             effective = self.schedule_facts()[2]
             try:
                 manager_status = self.overlay({"command": "status"})
@@ -229,13 +361,20 @@ class ScreensaverPolicy:
                 self.active_token = None
                 self.active_generation = None
                 self.active_mode = None
-            if self.active_requested and not self.active_token:
+                if candidate and candidate.get("state") == "failed":
+                    self.last_error = candidate.get(
+                        "failure_reason", "overlay request failed")
+                    self.retry_not_before = self.monotonic() + 5.0
+            if (self.active_requested and not self.active_token
+                    and self.monotonic() >= self.retry_not_before):
                 print("tvbox-screensaverd: reissuing requested overlay",
                       file=sys.stderr, flush=True)
                 try:
-                    self.start()
+                    self._start(self.activation_source,
+                                self.automatic_idle_epoch)
                 except (OSError, RuntimeError, ValueError) as exc:
                     self.last_error = str(exc)
+                    self.retry_not_before = self.monotonic() + 5.0
                     self.publish()
                 return
             if self.active_token:
@@ -266,6 +405,7 @@ class ScreensaverPolicy:
             overlay = None
         active = (overlay or {}).get("active_request")
         return {
+            "activation_source": self.activation_source,
             "manual_override": self.manual_override,
             "active_requested": self.active_requested,
             "scheduled_mode": scheduled,
@@ -277,6 +417,15 @@ class ScreensaverPolicy:
             "active_generation": self.active_generation,
             "active_mode": self.active_mode,
             "last_error": self.last_error,
+            "automatic": {
+                "enabled": self.config.automatic_enabled,
+                "eligible": bool(self.idle_input.get("eligible")),
+                "idle_epoch": self.automatic_idle_epoch,
+                "suppressed_idle_epoch": self.suppressed_idle_epoch,
+                "reconcile_interval_seconds":
+                    self.config.reconcile_interval_seconds,
+            },
+            "idle_input": self.idle_input,
             "overlay_active": active,
             "evaluated_at": moment.isoformat(),
         }

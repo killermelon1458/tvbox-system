@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import selectors
 import socket
 import sys
 import threading
@@ -15,6 +16,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 
 from tvbox.runtime import runtime_root
+from tvbox.screensaver.idle_watch import IdleStateWatcher
 from tvbox.screensaver.policy import ScreensaverPolicy
 
 
@@ -59,32 +61,52 @@ def main():
     server.bind(str(socket_path))
     os.chmod(socket_path, 0o600)
     server.listen(8)
-    server.settimeout(0.25)
+    server.setblocking(False)
+    watcher = None
+    selector = selectors.DefaultSelector()
+    selector.register(server, selectors.EVENT_READ, "server")
+    try:
+        watcher = IdleStateWatcher(root)
+        selector.register(watcher, selectors.EVENT_READ, "idle")
+    except OSError as exc:
+        print(f"tvbox-screensaverd: idle-state inotify unavailable: {exc}",
+              file=sys.stderr, flush=True)
+    next_reconcile = time.monotonic()
     try:
         while not stop_event.is_set():
-            policy.tick()
-            try:
+            now = time.monotonic()
+            if now >= next_reconcile:
+                policy.tick()
+                next_reconcile = now + policy.config.reconcile_interval_seconds
+            timeout = max(0.0, min(1.0, next_reconcile - time.monotonic()))
+            for key, _ in selector.select(timeout):
+                if key.data == "idle":
+                    if watcher.changed():
+                        policy.tick()
+                    continue
                 connection, _ = server.accept()
-            except socket.timeout:
-                continue
-            with connection:
-                try:
-                    data = b""
-                    while b"\n" not in data and len(data) < 1024 * 1024:
-                        chunk = connection.recv(65536)
-                        if not chunk:
-                            break
-                        data += chunk
-                    response = dispatch(policy, json.loads(data.split(b"\n", 1)[0]))
-                except (ValueError, RuntimeError, OSError) as exc:
-                    response = {"ok": False, "error": str(exc)}
-                connection.sendall(json.dumps(response).encode() + b"\n")
+                with connection:
+                    try:
+                        data = b""
+                        while b"\n" not in data and len(data) < 1024 * 1024:
+                            chunk = connection.recv(65536)
+                            if not chunk:
+                                break
+                            data += chunk
+                        response = dispatch(
+                            policy, json.loads(data.split(b"\n", 1)[0]))
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        response = {"ok": False, "error": str(exc)}
+                    connection.sendall(json.dumps(response).encode() + b"\n")
     finally:
         try:
             policy.shutdown()
         except (OSError, RuntimeError):
             pass
         server.close()
+        selector.close()
+        if watcher:
+            watcher.close()
         try:
             socket_path.unlink()
         except FileNotFoundError:

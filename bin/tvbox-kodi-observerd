@@ -1,0 +1,50 @@
+#!/usr/bin/python3
+"""Observation-only incremental Kodi/Plex player event daemon."""
+
+import argparse
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from tvbox.idle.kodi_log import KodiLogFollower
+from tvbox.idle.kodi_observer import KodiObservationWriter
+
+
+def run(log_path, once=False):
+    writer = KodiObservationWriter()
+    follower = KodiLogFollower(log_path, writer)
+    stopping = False
+
+    def stop(*_args):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while not stopping:
+        follower.poll()
+        if once:
+            break
+        deadline = time.monotonic() + 0.25
+        while not stopping and time.monotonic() < deadline:
+            time.sleep(min(0.1, deadline - time.monotonic()))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", nargs="?", choices=("run", "once"),
+                        default="run")
+    parser.add_argument("--log", default=os.environ.get(
+        "TVBOX_KODI_LOG", str(Path.home() / ".kodi/temp/kodi.log")))
+    args = parser.parse_args()
+    return run(args.log, args.command == "once")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

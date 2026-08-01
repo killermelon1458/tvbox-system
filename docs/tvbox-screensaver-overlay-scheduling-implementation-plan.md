@@ -1,6 +1,6 @@
 # TVBox Screensaver, Scheduling, and Overlay Implementation Plan
 
-**Status:** Implemented and live-validated 2026-07-31
+**Status:** Implemented and live-validated 2026-07-31, including canonical idle reaction
 **Scope:** Screensaver policy, scheduling, overlay lifecycle, black renderer, slideshow renderer
 **Out of scope:** Loading-screen policy, deep-idle/CEC standby, controller interception, broad provider rollout
 
@@ -440,6 +440,12 @@ Raw controller input is not interceptable through layer-shell. Automatic screens
 
 ## 19. Automatic idle scope
 
+> **Implemented 2026-07-31:** `tvbox-screensaverd` consumes the canonical
+> `idle-state.json`, validates schema/boot/freshness/health, and owns the exact
+> automatic overlay token. Desktop is the only enabled V1 provider. Manual stop
+> suppresses the current idle epoch; manual activation remains independent.
+> `tvbox-idled` remains observation-only.
+
 Initial candidates:
 
 - stable Kodi menu, after playback detection is trustworthy
@@ -486,7 +492,8 @@ Test FLIRC ordinary wake, physical keyboard/mouse wake, F12/Home, input leakage,
 
 ### Phase 7 — Narrow automatic idle policy
 
-Enable only proven providers and contexts.
+Implemented for valid canonical desktop idle only. Kodi and every other
+unsupported or uncertain provider remain inhibited.
 
 ### Later phases
 
@@ -569,7 +576,10 @@ Live Photo `.mov`), SVG, DNG/RAW, and animation playback. Slideshow scanning
 is Syncthing-safe, decoding is per-file and asynchronous, alpha is flattened
 over black, and `contain` remains the default fit.
 
-Activity-observation dependency selection is deferred until automatic idle work.
+Automatic idle reaction is implemented in `tvbox-screensaverd`. The canonical
+idle engine remains observation-only. Production Kodi/Plex eligibility is now
+provided by the separate current-session Kodi observer and conservative Kodi
+provider; screensaver policy does not parse Kodi logs or recalculate playback.
 
 ## 23. Initial-release done criteria
 

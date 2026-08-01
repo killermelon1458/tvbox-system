@@ -1,0 +1,70 @@
+#!/usr/bin/python3
+"""Publish approved physical keyboard/pointer activity facts."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from tvbox.idle.activity import ActivityCollector
+from tvbox.idle.config import load_config
+from tvbox.runtime import read_json, runtime_root
+
+
+def config_path(value=None):
+    return Path(value or os.environ.get(
+        "TVBOX_IDLE_CONFIG", str(Path.home() / ".config/tvbox/idle.toml")))
+
+
+def show_status():
+    value = read_json(runtime_root() / "activity-state.json")
+    print(json.dumps(value, indent=2, sort_keys=True))
+    return 0 if value else 1
+
+
+def run(path, once=False):
+    config = load_config(path)
+    collector = ActivityCollector(config)
+    stopping = False
+
+    def stop(*_args):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    collector.rescan()
+    if once:
+        collector.close()
+        return 0
+    last_scan = time.monotonic()
+    try:
+        while not stopping:
+            collector.poll(min(0.25, config.device_rescan_seconds))
+            if time.monotonic() - last_scan >= config.device_rescan_seconds:
+                collector.rescan()
+                last_scan = time.monotonic()
+    finally:
+        collector.close()
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", nargs="?", choices=["run", "once", "status"],
+                        default="run")
+    parser.add_argument("--config")
+    args = parser.parse_args()
+    if args.command == "status":
+        return show_status()
+    return run(config_path(args.config), once=args.command == "once")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

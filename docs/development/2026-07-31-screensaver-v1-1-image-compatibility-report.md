@@ -151,8 +151,12 @@ Slideshow paints black with Cairo SOURCE, then its centered opaque pixbuf with
 Cairo OVER in the same callback. Transparent input is flattened over black.
 `contain` is the validated default.
 
-Discovery uses non-following regular-file stats and excludes Syncthing
-internals, hidden files, unsupported/video extensions, and oversized files.
+Discovery always includes the configured root and eligible nested directories
+as one collection. It uses non-following regular-file stats, prunes directory
+symlinks and Syncthing/hidden internals, deduplicates device/inode identities,
+and excludes unsupported/video extensions and oversized files. Directory
+failures are logged and isolated, and an iterative worklist avoids recursion
+limits and traversal loops.
 The loader validates content, bounds decode dimensions, applies embedded
 orientation, checks size/mtime/inode before and after decode, and logs each
 unchanged failure once. One worker holds current plus next decoded images; a

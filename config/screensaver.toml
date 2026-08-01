@@ -3,6 +3,12 @@ default_mode = "slideshow"
 timezone = "America/Chicago"
 output = "0"
 
+[screensaver.automatic]
+enabled = true
+idle_state_stale_seconds = 5
+reconcile_interval_seconds = 1
+suppress_after_manual_stop = "until-next-idle-epoch"
+
 [[screensaver.schedule]]
 start = "00:00"
 end = "08:00"
@@ -10,7 +16,6 @@ mode = "black"
 
 [slideshow]
 image_directory = "/home/tvbox/Pictures/Screensaver"
-recursive = true
 image_duration = 30.0
 fit_mode = "contain"
 shuffle = true

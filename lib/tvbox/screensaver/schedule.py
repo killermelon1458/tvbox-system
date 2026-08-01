@@ -44,6 +44,10 @@ class ScreensaverConfig:
     max_decode_dimension: int
     rescan_interval: int
     output: str
+    automatic_enabled: bool
+    idle_state_stale_seconds: float
+    reconcile_interval_seconds: float
+    suppress_after_manual_stop: str
     config_path: str | None = None
 
 
@@ -104,14 +108,30 @@ def load_config(path):
     rescan_interval = int(slideshow.get("rescan_interval", 30))
     if not 5 <= rescan_interval <= 3600:
         raise ConfigError("rescan_interval out of range")
+    if slideshow.get("recursive", True) is not True:
+        raise ConfigError("slideshow recursive discovery cannot be disabled")
+    automatic = saver.get("automatic", {})
+    automatic_enabled = bool(automatic.get("enabled", True))
+    idle_stale = float(automatic.get("idle_state_stale_seconds", 5.0))
+    reconcile_interval = float(
+        automatic.get("reconcile_interval_seconds", 1.0))
+    suppression = automatic.get(
+        "suppress_after_manual_stop", "until-next-idle-epoch")
+    if not 1.0 <= idle_stale <= 60.0:
+        raise ConfigError("idle_state_stale_seconds out of range")
+    if not 0.25 <= reconcile_interval <= 10.0:
+        raise ConfigError("reconcile_interval_seconds out of range")
+    if suppression != "until-next-idle-epoch":
+        raise ConfigError("invalid automatic suppression policy")
     return ScreensaverConfig(
         default, timezone, tuple(rules),
         str(slideshow.get("image_directory",
                           str(Path.home() / "Pictures" / "Screensaver"))),
-        bool(slideshow.get("recursive", True)), duration, fit,
+        True, duration, fit,
         bool(slideshow.get("shuffle", True)), extensions, max_files,
         max_file_bytes, max_decode_dimension, rescan_interval,
-        str(saver.get("output", "")), str(path),
+        str(saver.get("output", "")), automatic_enabled, idle_stale,
+        reconcile_interval, suppression, str(path),
     )
 
 

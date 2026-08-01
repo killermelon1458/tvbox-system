@@ -95,6 +95,14 @@ mode = "slideshow"
         with self.assertRaises(ConfigError):
             load_config(self.path)
 
+    def test_recursive_discovery_is_mandatory(self):
+        self.assertTrue(self.config.recursive)
+        self.path.write_text(CONFIG.replace(
+            'image_directory = "/tmp/images"',
+            'image_directory = "/tmp/images"\nrecursive = false'))
+        with self.assertRaisesRegex(ConfigError, "cannot be disabled"):
+            load_config(self.path)
+
 
 if __name__ == "__main__":
     unittest.main()

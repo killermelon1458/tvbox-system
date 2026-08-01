@@ -38,7 +38,8 @@ class Slideshow:
         logging.basicConfig(
             level=logging.INFO,
             format="tvbox-render-slideshow: %(levelname)s %(message)s")
-        self.reporter = FailureReporter()
+        self.logger = logging.getLogger("tvbox.slideshow")
+        self.reporter = FailureReporter(self.logger)
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="tvbox-image-decode")
         self.stopping = False
@@ -74,9 +75,9 @@ class Slideshow:
 
     def _scan(self):
         return order_images(scan_images(
-            self.args.image_directory, bool_value(self.args.recursive),
+            self.args.image_directory, True,
             self.args.extensions.split(","), self.args.max_files,
-            self.args.max_file_bytes,
+            self.args.max_file_bytes, logger=self.logger,
         ), bool_value(self.args.shuffle))
 
     def _rescan(self):

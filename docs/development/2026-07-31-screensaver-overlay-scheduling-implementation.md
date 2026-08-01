@@ -157,10 +157,11 @@ production uses zone `-1` to ignore other exclusive zones while reserving no
 workspace. A full-frame capture had no non-black pixels.
 
 Readiness is sent after GTK `after-paint`. Black explicitly paints with Cairo
-SOURCE. Slideshow scans a bounded extension allowlist, honors EXIF orientation,
-supports contain/cover, skips invalid files, and retains only current plus one
-predecoded next image. Missing/empty/invalid sources commit opaque black and
-report `no-valid-images-black-fallback`.
+SOURCE. Slideshow recursively scans the configured root and nested directories
+as one bounded collection, does not follow directory symlinks, honors EXIF
+orientation, supports contain/cover, skips invalid files, and retains only
+current plus one predecoded next image. Missing/empty/invalid sources commit
+opaque black and report `no-valid-images-black-fallback`.
 
 ## Commands
 

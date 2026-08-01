@@ -336,6 +336,31 @@ tvbox-screensaver mode scheduled
 tvbox-screensaver formats
 ```
 
+Automatic reaction is configured in the same file:
+
+```toml
+[screensaver.automatic]
+enabled = true
+idle_state_stale_seconds = 5
+reconcile_interval_seconds = 1
+suppress_after_manual_stop = "until-next-idle-epoch"
+```
+
+`tvbox-screensaverd` watches the runtime directory for atomic
+`idle-state.json` replacement and reconciles periodically. It accepts only a
+current-boot, supported, fresh `state=idle`/`idle=true` record with healthy
+activity, application, and provider facts. Missing, malformed, stale,
+wrong-boot, unsupported, non-idle, inhibited, degraded, recovering, or
+display-absent input releases only its exact automatic request token.
+
+Status reports `idle_input`, `automatic`, `activation_source`, scheduled and
+effective modes, the owned token/generation, and the overlay manager's active
+renderer/readiness/lease observation. `manual`, `automatic`, and `inactive`
+activation sources are distinct. Manual start works regardless of idle input.
+Stopping an automatic saver suppresses its boot/writer/provider/epoch tuple
+until canonical idle becomes non-idle or a later epoch arrives. Mode commands
+change the existing request's renderer; they do not create competing requests.
+
 The default schedule selects black from 00:00 through 08:00
 `America/Chicago`, otherwise slideshow. The slideshow source defaults to
 `~/Pictures/Screensaver`; absent or invalid content remains opaque black and
@@ -353,13 +378,23 @@ centered `contain` fit. Black and the image are drawn in one Cairo frame;
 input alpha is flattened over black. Both overlay windows own a GDK blank
 cursor which disappears automatically with the surface.
 
-The recursive scan excludes hidden entries, `.stfolder`, `.stversions`,
-Syncthing temporary names, non-regular files, video, and unsupported media.
+The configured source is always scanned recursively as one combined collection;
+there is no per-directory weighting or recursion toggle. Directory symlinks are
+not followed, repeated device/inode identities are deduplicated, and traversal
+uses a bounded non-recursive worklist. The scan excludes hidden entries,
+`.stfolder`, `.stversions`, Syncthing temporary names, non-regular files, video,
+and unsupported media. Inaccessible or disappearing subdirectories are logged
+and skipped without aborting sibling discovery.
 Every decode is isolated on one background worker. Size/mtime/inode changes
 before or during decode reject that attempt, unchanged failures are
 deduplicated, and rescans retry changed files and discover completed additions.
 
 Rollback:
+
+To disable only automatic idle reaction while retaining manual screensavers,
+scheduling, renderers, and the overlay manager, set
+`screensaver.automatic.enabled = false` and run `tvbox-screensaver reload`.
+The policy releases only its exact automatic token. For full subsystem rollback:
 
 ```bash
 systemctl --user disable --now tvbox-screensaver-policy.service
@@ -377,6 +412,87 @@ systemctl --user daemon-reload
 Restore a timestamped `~/.config/tvbox/screensaver.toml.bak.*` only when
 rolling back an intentional configuration replacement. Do not kill renderers
 by executable name; stopping the manager unit removes its control group.
+
+## Canonical Activity and Idle-State Services
+
+The installer deploys and enables:
+
+```text
+tvbox-activityd.service
+tvbox-idled.service
+tvbox-kodi-observer.service
+```
+
+It installs `~/.config/tvbox/idle.toml` when absent and ensures the dedicated
+TVBox user belongs to the `input` group. A newly added group membership takes
+effect at the next login. Runtime files are:
+
+```text
+%t/tvbox/activity-state.json
+%t/tvbox/idle-state.json
+%t/tvbox/kodi-state.json
+```
+
+Both are schema-versioned, boot-checked, atomically replaced mode-0600 files.
+`tvbox-state status` aggregates both as read-only facts. Direct status commands:
+
+```bash
+tvbox-activityd status
+tvbox-idled status
+```
+
+V1 activity sources are FLIRC keyboard, physical keyboards, pointer buttons,
+and thresholded physical relative-pointer movement. Devices use `/dev/input/by-id`
+identity where available and are rescanned for hotplug. Release-only events,
+pointer jitter, AntiMicroX virtual interfaces, controller-derived keyboard/
+mouse interfaces, raw controllers, power/HDMI nodes, and CEC are excluded.
+No evdev grab is used.
+
+The desktop provider is enabled with a 300-second timeout. Kodi uses a
+600-second stopped-anywhere policy and requires healthy FLIRC, keyboard, and
+pointer sources. The observation-only `tvbox-kodi-observerd` incrementally
+follows only allowlisted Kodi player events and binds them to exact Kodi PID,
+process start ticks, executable, and boot ID. Starting, playing, paused,
+unknown, stale, unhealthy, or session-mismatched observations inhibit;
+healthy current-session stopped is eligible. Kodi/observer restart, log
+rotation, and truncation reset playback to unknown until a new current-run
+event establishes it. No media titles, paths, URLs, tokens, or log bodies are
+published. Spotify, YouTube, Moonlight, Steam Link, Mario Kart, and unknown
+contexts remain inhibited.
+
+Canonical states are `active`, `idle-pending`, `idle`, `inhibited`, `unknown`,
+`degraded`, `display-absent`, and `recovering`. Only `state=idle` publishes
+`idle=true`. Provider/context/activity/config changes start a fresh epoch.
+Application transitions, recovery, disagreement, missing/stale activity,
+display loss, and unsupported contexts cannot assert idle.
+
+The activity and idle services are observation-only. They do not start/stop screensavers,
+request overlays, choose a renderer, read the screensaver schedule, change an
+input profile, or invoke Home/recovery. The separate screensaver policy consumes
+their canonical record; it does not recalculate activity or provider rules.
+
+Rollback:
+
+```bash
+systemctl --user disable --now tvbox-idled.service
+systemctl --user disable --now tvbox-activityd.service
+systemctl --user disable --now tvbox-kodi-observer.service
+unlink ~/.config/systemd/user/tvbox-idled.service
+unlink ~/.config/systemd/user/tvbox-activityd.service
+unlink /usr/local/bin/tvbox-idled
+unlink /usr/local/bin/tvbox-activityd
+unlink /usr/local/bin/tvbox-kodi-observerd
+systemctl --user daemon-reload
+```
+
+Remove `%t/tvbox/idle-state.json` and `activity-state.json` only after the
+services stop. If the installer added `tvbox` to `input` solely for this
+feature, `sudo gpasswd -d tvbox input` rolls that membership back after review;
+do not remove it if another appliance component relies on raw input access.
+
+To roll back only Kodi automatic idle support, leave the canonical engine and
+automatic screensaver consumer installed, set `[providers.kodi] enabled = false`,
+and restart `tvbox-idled.service`. The result is conservative Kodi inhibition.
 
 ## Known Gaps
 
